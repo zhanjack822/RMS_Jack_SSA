@@ -38,3 +38,4 @@ pyswarms; sys_platform == "linux" and platform_machine == "x86_64"
 skyfield; sys_platform == "win32"
 skyfield; sys_platform == "darwin"
 skyfield; sys_platform == "linux" and platform_machine == "x86_64"
+opencv-python-headless
