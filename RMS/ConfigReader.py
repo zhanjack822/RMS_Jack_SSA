@@ -16,9 +16,12 @@
 
 from __future__ import absolute_import, division, print_function
 
+import datetime
+import logging
 import math
 import os
 import sys
+from RMS.CompileArgs import getCompileArgs
 from RMS.Misc import getRmsRootDir
 from Utils.GenerateTimelapse import isFfmpegWorking
 import matplotlib.colors as mcolors
@@ -30,6 +33,16 @@ else:
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
     from ConfigParser import NoOptionError, RawConfigParser
     FileNotFoundError = IOError  # Map FileNotFoundError to IOError in Python 2
+
+# Module logger - propagates to the root logger, so warnings end up in the night log once logging is
+# initialized, and on the console before that
+log = logging.getLogger(__name__)
+
+
+# Distortion types of a platepar (see Platepar.setDistortionType), the options of platepar_distortion_type
+PLATEPAR_DISTORTION_TYPES = ("poly3+radial", "poly3+radial3", "poly3+radial5", "radial3-all", "radial4-all",
+                             "radial5-all", "radial3-odd", "radial5-odd", "radial7-odd", "radial9-odd")
+
 
 # Used to determine if ML filtering is available
 TFLITE_AVAILABLE = False
@@ -50,107 +63,9 @@ except ImportError:
             pass
 
 
-def choosePlatform(win_conf, rpi_conf, linux_pc_conf):
-    """ Choose the setting depending on if this is running on the RPi or a Linux PC. """
-
-    # Check if running on Windows.
-    # ``startswith`` ensures the platform string actually begins with ``"win"``
-    # instead of matching other identifiers that merely contain that substring.
-    if sys.platform.startswith('win'):
-        return win_conf
-
-    else:
-
-        if 'arm' in os.uname()[4]:
-            return rpi_conf
-
-        else:
-            return linux_pc_conf
-
-
-
-def findBinaryPath(config, dir_path, binary_name, binary_extension):
-    """ Given the path of the build directory and the name of the binary (without the extension!), the
-        function will find the path to the binary file.
-
-    Arguments:
-        dir_path: [str] The build directory with binaries.
-        binary_name: [str] The name of the binary without the extension.
-        binary_extension: [str] The extension of the binary (e.g. 'so'), without the dot.
-
-    Return:
-        file_path: [str] Relative path to the binary.
-    """
-
-
-    if binary_extension is not None:
-        binary_extension = '.' + binary_extension
-
-
-    # If the directory path from the config file doesn't exist, use the default path
-    if not os.path.exists(dir_path):
-        dir_path = config.rms_root_dir
-
-
-    file_candidates = []
-
-    # Recursively find all files with the given extension in the given directory
-    for file_path in os.walk(dir_path):
-        for file_name in file_path[-1]:
-
-            found = False
-
-            # Check if the files correspond to the search pattern
-            if file_name.startswith(binary_name):
-
-                if binary_extension is not None:
-                    if file_name.endswith(binary_extension):
-                        found = True
-
-                else:
-                    found = True
-
-
-            if found:
-                file_path = os.path.join(file_path[0], file_name)
-                file_candidates.append(file_path)
-
-
-    # If there is only one file candiate, take that one
-    if len(file_candidates) == 0:
-        return None
-
-    elif len(file_candidates) == 1:
-        return file_candidates[0]
-
-    else:
-        # If there are more candidates, find the right one for the running version of python, platform, and
-        #   bits
-
-
-        # Find the compiled module for the correct python version
-        for file_path in file_candidates:
-            
-            # Extract the name of the dir where the binary is located
-            binary_dir = os.path.split(os.path.split(file_path)[0])[1]
-            # take the final section as the version
-            binary_dir_version = binary_dir.split('-')[-1]
-
-
-            # the binary directory may or may not contain a dot in the version
-            # e.g lib.linux-x86_64-3.7 vs lib.linux-x86_64-cpython-311
-            if '.' in binary_dir_version:
-                py_version = "{:d}.{:d}".format(sys.version_info.major, sys.version_info.minor)
-            else:
-                py_version = "{:d}{:d}".format(sys.version_info.major, sys.version_info.minor)
-
-            # If the directory ends with the correct python version, take that binary
-            if binary_dir_version == py_version:
-                return file_path
-
-
-        # If no appropriate binary was found, give up
-        return None
+# Platform selection of compile arguments lives in RMS.CompileArgs so that setup.py
+# and the .pyxbld files can use it without importing this module's heavy dependencies
+choosePlatform = getCompileArgs
 
 
 
@@ -283,12 +198,20 @@ class Config:
 
         self.reboot_after_processing = False
         self.reboot_lock_file = ".reboot_lock"
-        
+
+        self.time_server = "time.cloudflare.com"
+
         ##### Capture
         self.deviceID = 0
 
         # Transport Layer Protocol: tcp or udp
         self.protocol = "tcp"
+
+        # Per-socket UDP receive buffer size in bytes for the rtspsrc element (gst
+        # backend). Larger values give RTP bursts more room and prevent UDP
+        # RcvbufErrors -> dropped frames. Requires net.core.rmem_max >= this value
+        # (see Scripts/UpdateBuffers.sh) or the kernel clamps it back.
+        self.udp_buffer_size = 16777216
 
         # Media backend to use for capture. Options are gst, cv2, or v4l2
         self.media_backend = "gst"
@@ -298,6 +221,9 @@ class Config:
 
         # Decoder for the gstreamer media backend (e.g. decodebin, avdec_h264, nvh264dec)
         self.gst_decoder = "avdec_h264"
+
+        # Max buffers per GStreamer queue element (lower values reduce memory usage on multi-cam systems)
+        self.gst_queue_size = 100
 
         # Path to the json file containing camera settings
         self.camera_settings_path = "./camera_settings.json"
@@ -317,6 +243,9 @@ class Config:
         self.height = 720
         self.width_device = self.width
         self.height_device = self.height
+        self.video_scale_width = None
+        self.video_scale_height = None
+        self.video_crop = None
         self.fps = 25.0
 
         # Camera buffer in number of frames. This will applied a buffer/fps correction to
@@ -326,6 +255,11 @@ class Config:
         # Camera latency in seconds. This will applied an offset to the timestamps
         # when in GStreamer Standalone mode
         self.camera_latency = 0.05
+
+        # The point of the exposure of every frame at which the frames of frame block (.fblk) files are timed:
+        #   'start', 'middle' or 'end'. The blocks record the time of the start of the integration; the position
+        #   of a moving object measured on a frame is its position at the middle of the exposure
+        self.frame_block_time = 'middle'
 
 
         self.report_dropped_frames = False
@@ -347,6 +281,15 @@ class Config:
         self.fov_w = 64.0
         self.fov_h = 35.0
         self.deinterlace_order = -2
+
+        # Rolling shutter (deinterlace_order -1): the measured time in which the sensor reads all its rows (s), 0
+        #   for no correction (see RMS.Routines.RollingShutterCorrection)
+        self.rolling_shutter_readout = 0.0
+
+        # Correction of the timestamps of the frames (s), added when the frames of a recording are read for
+        #   processing (true time = timestamp + correction), see .config
+        self.frame_time_offset = 0.0
+
         self.mask_file = "mask.bmp"
 
         self.data_dir = "~/RMS_data"
@@ -460,6 +403,19 @@ class Config:
         # Automatically reprocess broken capture directories
         self.auto_reprocess = True
 
+        # Give up on a capture directory after this many failed auto-reprocess attempts. 0 disables
+        #   the guard and retries forever
+        self.auto_reprocess_max_attempts = 3
+
+        # Also auto-reprocess nights which look processed but have no directory in ArchivedFiles.
+        #   Off by default because retention and quota management delete ArchivedFiles independently
+        #   of CapturedFiles, so a missing archive does not reliably mean the night is unprocessed
+        self.reprocess_if_archive_missing = False
+
+        # File in the captured directory which records how far processing got and how many
+        #   auto-reprocess attempts have failed
+        self.processing_status_file = ".rms_processing_status"
+
         # Flag file which indicates that the previously processed files are loaded during capture resume
         self.capture_resume_flag_file = ".capture_resuming"
 
@@ -533,7 +489,7 @@ class Config:
 
 
         ##### Weave compilation arguments
-        self.extra_compile_args = ["-O3"]
+        self.extra_compile_args = getCompileArgs()
         
         ##### FireballDetection
 
@@ -587,12 +543,13 @@ class Config:
         self.max_lines_det = 30 # maximum number of lines to be found on the time segment with KHT
         self.line_min_dist = 40 # Minimum distance between KHT lines in Cartesian space to merge them (used for merging similar lines after KHT)
         self.stripe_width = 20 # width of the stripe around the line
-        self.kht_build_dir = os.path.join(self.rms_root_dir, 'RMS', 'build')
-        self.kht_binary_name = 'kht_module'
-        self.kht_binary_extension = 'so'
 
         # Background estimation parameters
         self.background_reservoir_size = 64
+
+        # Number of threads of the median and the noise of the background of every frame chunk (0 for all CPU
+        #   cores), e.g. when there are more CPU cores than cameras
+        self.median_threads = 1
 
         # KHT Line finding parameters
         # Minimum number of pixels required to form a valid cluster
@@ -680,7 +637,7 @@ class Config:
         self.ransac3d_min_frames = 4.0
 
         # Number of random line hypotheses tested per 3D RANSAC search pass.
-        self.ransac3d_iterations = 10
+        self.ransac3d_iterations = 100
 
         # Maximum distance used when stitching nearby 3D line fragments with
         # similar directions into one candidate detection.
@@ -835,6 +792,14 @@ class Config:
         self.platepar_remote_name = 'platepar_latest.cal'
         self.remote_platepar_dir = 'platepars'
 
+        # Model of a platepar fitted from scratch by AutoPlatepar, of a new platepar in SkyFit2 and of its default
+        #   settings: the distortion type and the flags of the radial distortion types
+        self.platepar_distortion_type = 'radial7-odd'
+        self.platepar_equal_aspect = True
+        self.platepar_asymmetry_corr = True
+        self.platepar_decentering_corr = False
+        self.platepar_force_distortion_centre = False
+
         # Download remote mask
         self.mask_download_permissive = True
         self.mask_remote_name = 'mask_latest.bmp'
@@ -858,6 +823,15 @@ class Config:
         # Maximum number of stars to use for recalibration on a single FF
         self.recalibration_max_stars = 200
 
+        # Minimum fraction of detected stars that a per-FF recalibration fit
+        #   must match to be accepted (guards against sparse spurious fits
+        #   chaining forward on cloudy nights)
+        self.recalibration_min_match_fraction = 0.6
+
+        # Refine the pointing of every per-FF recalibration by least squares on the matched stars (the search
+        #   alone stops within its tolerance, about dist_check_threshold)
+        self.recalibration_lsq_refine = True
+
         ##### Thumbnails
         self.thumb_bin = 4
         self.thumb_stack = 5
@@ -870,6 +844,243 @@ class Config:
         ##### Timelapse
         self.timelapse_generate_captured = True
         self.timelapse_generate_from_frames = True
+
+
+        ##### Monitor processing (RMS.MonitorProcessFrameInterface)
+
+        # Save the max pixel and average pixel images of every star extraction chunk as FF-equivalent PNG
+        #   image pairs, which are needed for the night reports
+        self.monitor_save_images = True
+
+        # When to generate the night report: 'sunrise' (after the end of the night once all its data is
+        #   processed), 'idle' (whenever all data is processed), 'external' (only on a trigger file or from
+        #   the command line), or 'none'
+        self.monitor_report_mode = 'sunrise'
+
+        # Minutes without new processed files before a night report is generated
+        self.monitor_report_quiet_min = 15.0
+
+        # Time of day (UTC, HH:MM) of a partial report of the night, made with the data processed until then
+        #   if the processing of the night is not finished yet. Empty disables it
+        self.monitor_partial_report_time = ''
+
+        # Hours after the end of the night (sunrise) after which its files which were not processed yet are
+        #   skipped, so the processing doesn't overflow into the following night. 0 disables it
+        self.monitor_night_cutoff_hours = 0.0
+
+        # Upload the night archive after the report (also requires upload_enabled)
+        self.monitor_upload = False
+
+        # Delete the image pairs of reported nights after this many days (0 keeps them)
+        self.monitor_delete_images_days = 0
+
+        # Delete old data from the output directory like normal RMS does in the data directory (old night
+        #   directories, archives and logs, by capt_dirs_to_keep, arch_dirs_to_keep, the quotas, and the free
+        #   space needed for the next night)
+        self.monitor_delete_old_data = True
+
+        # Save the most confident recalibrated platepar of the night (most matched stars, lowest residual) and
+        #   use it for the following data
+        self.monitor_update_platepar = True
+
+        # Calibrate the camera automatically: fit a platepar from the stars when there is none, and fit it again
+        #   when the platepar no longer fits the stars on a clear sky
+        self.monitor_auto_calibration = False
+
+        # Minutes of clear sky between the attempts to fit a better platepar than the current one
+        self.monitor_auto_calibration_interval = 30.0
+
+        # Fit the vignetting coefficient also when a platepar exists (it is always fitted without one)
+        self.monitor_auto_calibration_fit_vignetting = False
+
+        # Only save the fitted platepars as candidates, don't use them
+        self.monitor_auto_calibration_dry_run = False
+
+        # Save every calibrated detection as an ECSV file (in the ECSV directory of the night)
+        self.monitor_save_ecsv = False
+
+        # Additional night products
+        self.monitor_shower_association = False
+        self.monitor_fov_kml = False
+        self.monitor_flux = False
+        self.monitor_observation_summary = False
+
+        # Local directory to which every input file is copied before it is processed, for inputs on a slow
+        #   network. Empty disables it
+        self.monitor_staging_dir = ''
+
+        # Continuous detection over the consecutive files of a recording: a file which follows the previous file
+        #   without missing frames is searched with the last chunks of frames of the previous file in front of it,
+        #   and the detections of an object which crosses the boundary are joined into one, kept in the results of
+        #   the file where it begins (see RMS.ContinuousResults). Only with the matched filter replacing the normal
+        #   detection, without mf_buffer_memory
+        self.monitor_continuous = False
+        self.monitor_continuous_chunks = 1
+
+        # Keep the live status of the monitor in a JSON file in the output directory (monitor_status.json), for
+        #   external monitoring, rewritten every given number of seconds and after every processed file
+        self.monitor_status = True
+        self.monitor_status_interval = 60.0
+
+
+        #### Matched-filter detection of faint moving objects (RMS.MatchedFilterDetection)
+
+        # Run the matched-filter detection on every file in the monitor, after the normal detection
+        self.mf_enable = False
+
+        # With mf_enable, the matched filter replaces the normal detection in the monitor: its detections are the
+        #   results of every file (FTPdetectinfo, night report, archive); the stars are still extracted
+        self.mf_replace_detection = False
+
+        # Number of frames processed together (background, masks and search)
+        self.mf_block_frames = 256
+
+        # Detection threshold of the velocity search (sigma of the best velocity)
+        self.mf_threshold = 5.0
+
+        # Frames summed in the runs which are searched for the full range of speeds (longer runs find fainter
+        #   fast objects, at a higher cost), and in a run for slow objects (0 disables)
+        self.mf_run_frames = [8, 16]
+        self.mf_slow_run_frames = 32
+
+        # Search the full range of speeds (otherwise only slow objects are searched)
+        self.mf_velocity_search = True
+
+        # Speed range of the detected objects (deg/s)
+        self.mf_ang_vel_min = 0.01
+        self.mf_ang_vel_max = 2.0
+
+        # Minimum number of linked runs of a track
+        self.mf_min_hits = 3
+
+        # Minimum motion of a detection over its duration, in PSF widths (FWHM)
+        self.mf_min_displacement = 3.0
+
+        # Minimum duration of a detection (frames)
+        self.mf_min_frames = 20
+
+        # PSF sigma (px), 0 estimates it from the stars
+        self.mf_psf_sigma = 0.0
+
+        # Largest position error of a measurement (px). The measurements combine as few frames as possible
+        #   (up to mf_max_measure_frames) to keep the position error below it
+        self.mf_max_pos_error = 0.5
+        self.mf_max_measure_frames = 8
+
+        # Minimum signal-to-noise ratio of the fitted amplitude of a measurement
+        self.mf_min_sample_snr = 3.0
+
+        # The position uncertainties of the fit are multiplied by this, to match the errors measured on objects
+        #   added to real frames (the noise is not exactly Gaussian, and stars are not perfectly removed)
+        self.mf_sigma_scale = 1.3
+
+        # Minimum number of measurements of a detection
+        self.mf_min_centroids = 6
+
+        # Minimum combined significance of a detection: the PSF-weighted signal summed along its track over all
+        #   frames, minus the same at times when the object is elsewhere (sigma)
+        self.mf_track_significance = 12.0
+
+        # A detection whose light is less concentrated at its centre than this, compared with the brightest axis
+        #   through it (a thin linear structure, e.g. a trail, or light left along the path of a bright source which
+        #   crossed the field), is rejected. 0 turns the test off
+        self.mf_line_concentration = 0.5
+
+        # Largest RMS distance of a detection across its direction of motion from one smooth path over its whole
+        #   length (a quadratic in time, which follows the curvature of a real track): mf_track_deviation_fwhm PSF
+        #   FWHMs (the scatter of the measurements) plus mf_track_deviation_length times the length of the track
+        #   (the bending of a long track beyond the smooth path, e.g. by the distortion of a wide-field lens). Both
+        #   are dimensionless, so they hold for cameras of other fields of view. A track which wanders sideways
+        #   more is rejected. mf_track_deviation_fwhm 0 turns the test off
+        self.mf_track_deviation_fwhm = 0.6
+        self.mf_track_deviation_length = 0.005
+
+        # Stars brighter than this in the median of the frames (in the noise of the sky in one frame) are masked
+        self.mf_star_threshold = 3.0
+
+        # The normalized frames are clipped to +/- this before the search (single frame outliers)
+        self.mf_clip = 10.0
+
+        # Moving sources brighter than this in a frame (in the noise of one pixel) leave faint trails along their
+        #   row and column on some sensors; these rows and columns are left out of the search in that frame. 0
+        #   disables it
+        self.mf_trail_level = 25.0
+
+        # Pixels above the threshold in more than this fraction of all runs of the input are masked as static
+        self.mf_persistence = 0.2
+
+        # Margin from the image edge (px)
+        self.mf_edge_margin = 8
+
+        # Use the GPU for the search: auto (if CUDA is available), on, off
+        self.mf_gpu = 'auto'
+
+        # The positions of the measurements are combined over the measurements within +-this many frames (a
+        #   local quadratic fit of the track), which reduces their errors 2 to 5 times; 0 disables it
+        self.mf_smooth_frames = 64
+
+        # Largest number of candidate tracks measured per file, or per segment of a file read in segments (the
+        #   strongest ones), a safety limit of the processing time in bad conditions (e.g. thin clouds, very bright
+        #   stars). The measurement of more candidates costs little, and the strength of a candidate tells little
+        #   whether it is real
+        self.mf_max_tracks = 1000
+
+        # Largest gap (frames) between the hits of a track, e.g. between the flashes of a flashing object
+        self.mf_link_max_gap = 96
+
+        # Tiers of the velocity search: a tier with the bin B searches the speeds up to mf_tier_speed*B px per frame,
+        #   and the faster speeds are searched on frames binned twice as much, up to mf_max_bin (see
+        #   MatchedFilterDetector.searchTiers). 0 searches all speeds on 2x2 bins
+        self.mf_tier_speed = 2.0
+        self.mf_max_bin = 8
+
+        # A fast object is a streak in every frame: sum the whole streak of every frame (several samples per frame
+        #   along the motion, see velocitySamples), instead of only its middle. More sensitive to fast objects, at
+        #   the cost of more search time
+        self.mf_streak_search = False
+
+        # Faint objects: the hits of the search down to this threshold are linked into chains along straight tracks
+        #   over the whole input, and the chains whose signal summed along them is significant are measured like the
+        #   other tracks (see MatchedFilterDetector.faintTracks). An object below mf_threshold in most runs is then
+        #   still found from the runs where the noise adds to it. 0 disables it
+        self.mf_faint_threshold = 0.0
+
+        # Largest number of faint chains measured per file (or segment), the most significant ones
+        self.mf_faint_max_tracks = 50
+
+        # Saturation level of the raw frames (ADU): the saturated pixels are left out of the position fits and
+        #   counted in the saturation column of the detections. 0 uses 98% of the range of the bit depth (some
+        #   cameras saturate well below it)
+        self.mf_saturation_level = 0
+
+        # Number of CPU threads of the matched filter (0 = all cores). With several monitor workers, all cores
+        #   divided by the number of workers avoids oversubscribing the CPU
+        self.mf_threads = 0
+
+        # Memory of the frames read at once (GB per file being processed). With it, a .vid file is read once, in
+        #   segments of as many frames as fit, and every pass over the frames (stars, background, search,
+        #   measurement) takes them from memory; neighbouring segments share mf_segment_overlap frames, and the
+        #   detections found in both are joined. 0 reads the frames from the file for every pass
+        self.mf_buffer_memory = 0.0
+
+        # Memory for the normalized frames kept from the search for the measurement of the tracks (GB per file),
+        #   which then doesn't read and normalize them again. 0 reads them again
+        self.mf_cache_memory = 0.0
+        self.mf_segment_overlap = 512
+
+        # Clouded sky: the stars of every chunk of frames are matched to the catalog, and where the stars are
+        #   fainter than on clear sky by more than mf_cloud_max_offset (mag), or reliably seen stars are missing, the
+        #   sky is clouded (see RMS.Routines.SkyQuality). The clouded regions are not searched, and the measurements
+        #   on clouded sky are removed, as their positions and magnitudes can't be trusted. It needs the stars and
+        #   the platepar. The clear-sky brightness of every star is kept across the files of the camera, with a log
+        #   of the conditions of every chunk, in its output directory (sky_reference_*.npz, sky_conditions_*.csv)
+        self.mf_cloud_filter = True
+        self.mf_cloud_max_offset = 0.15
+
+        # Smallest number of stars of the clearest chunk which have to match the catalog for the sky quality: with a
+        #   calibration matching fewer, the sky quality is not known (every chunk would look clouded) and the
+        #   clouded sky is not excluded
+        self.mf_cloud_min_matched = 30
 
 
         #### Shower association
@@ -1009,7 +1220,7 @@ def parse(path, strict=True):
 
     # Disable upload if the default station name is used
     if config.stationID == "XX0001":
-        print("Disabled upload because the default station code is used!")
+        log.warning("Disabled upload because the default station code is used!")
         config.upload_enabled = False
     
 
@@ -1031,6 +1242,8 @@ def parseConfigFile(config, parser):
     parseStack(config, parser)
     parseTimelapse(config, parser)
     parseColors(config, parser)
+    parseMonitorProcessing(config, parser)
+    parseMatchedFilter(config, parser)
 
 
 def parseDFNStation(config, parser):
@@ -1130,6 +1343,10 @@ def parseSystem(config, parser):
     if parser.has_option(section, "reboot_lock_file"):
         config.reboot_lock_file = parser.get(section, "reboot_lock_file")
 
+    if parser.has_option(section, "time_server"):
+        time_server = parser.get(section, "time_server").strip()
+        if time_server != '':
+            config.time_server = time_server
 
     if parser.has_option(section, "event_monitor_db_name"):
         config.event_monitor_db_name = parser.get(section, "event_monitor_db_name")
@@ -1255,6 +1472,20 @@ def parseCapture(config, parser):
         config.height_device = config.height
 
 
+    # for scaling and or cropping source raw video for further processing
+    if parser.has_option(section, "video_scale_width"):
+        config.video_scale_width = parser.getint(section, "video_scale_width")
+
+    if parser.has_option(section, "video_scale_height"):
+        config.video_scale_height = parser.getint(section, "video_scale_height")
+
+    if parser.has_option(section, "video_crop"):
+        config.video_crop = parser.get(section, "video_crop").strip()
+        # Treat an empty value or the literal "none" as disabled
+        if config.video_crop == "" or config.video_crop.lower() == "none":
+            config.video_crop = None
+
+
     if parser.has_option(section, "report_dropped_frames"):
         config.report_dropped_frames = parser.getboolean(section, "report_dropped_frames")
 
@@ -1324,7 +1555,10 @@ def parseCapture(config, parser):
 
     if parser.has_option(section, "protocol"):
         config.protocol = parser.get(section, "protocol")
-    
+
+    if parser.has_option(section, "udp_buffer_size"):
+        config.udp_buffer_size = parser.getint(section, "udp_buffer_size")
+
     if parser.has_option(section, "media_backend"):
         config.media_backend = parser.get(section, "media_backend")
 
@@ -1333,6 +1567,11 @@ def parseCapture(config, parser):
 
     if parser.has_option(section, "gst_decoder"):
         config.gst_decoder = parser.get(section, "gst_decoder")
+
+    if parser.has_option(section, "gst_queue_size"):
+        # Clamp to >= 1: in GStreamer max-size-buffers=0 means *unlimited*, which would
+        # defeat the purpose of this setting and risk OOM.
+        config.gst_queue_size = max(1, parser.getint(section, "gst_queue_size"))
 
     if parser.has_option(section, "camera_settings_path") and os.path.isfile(parser.get(section, "camera_settings_path")):
         config.camera_settings_path = parser.get(section, "camera_settings_path")
@@ -1373,14 +1612,24 @@ def parseCapture(config, parser):
         # Limit the FPS to 1 million, as the time precision of datetime is 1 us
         if config.fps > 1000000:
             config.fps = 1000000
-            print()
-            print("WARNING! The FPS has been limited to 1,000,000!")
+            log.warning("The FPS has been limited to 1,000,000!")
 
     if parser.has_option(section, "camera_buffer"):
         config.camera_buffer = parser.getint(section, "camera_buffer")
 
     if parser.has_option(section, "camera_latency"):
         config.camera_latency = parser.getfloat(section, "camera_latency")
+
+    if parser.has_option(section, "frame_block_time"):
+        block_time = parser.get(section, "frame_block_time").strip().lower()
+
+        block_time_list = ['start', 'middle', 'end']
+        if block_time not in block_time_list:
+            log.warning('The frame block time {:s} is not one of {}. Defaulting to middle...'.format(
+                block_time, block_time_list))
+            block_time = 'middle'
+
+        config.frame_block_time = block_time
 
     if parser.has_option(section, "ff_format"):
         config.ff_format = parser.get(section, "ff_format")
@@ -1393,13 +1642,19 @@ def parseCapture(config, parser):
 
 
     if (config.fov_w <= 0) or (config.fov_h <= 0):
-        print('The field of view in the config file (fov_h and fov_w) have to be positive numbers!')
-        print('Make sure to set the approximate FOV size correctly!')
+        log.error('The field of view in the config file (fov_h and fov_w) have to be positive numbers!')
+        log.error('Make sure to set the approximate FOV size correctly!')
         sys.exit()
 
 
     if parser.has_option(section, "deinterlace_order"):
         config.deinterlace_order = parser.getint(section, "deinterlace_order")
+
+    if parser.has_option(section, "rolling_shutter_readout"):
+        config.rolling_shutter_readout = parser.getfloat(section, "rolling_shutter_readout")
+
+    if parser.has_option(section, "frame_time_offset"):
+        config.frame_time_offset = parser.getfloat(section, "frame_time_offset")
 
     if parser.has_option(section, "mask"):
         config.mask_file = os.path.basename(parser.get(section, "mask"))
@@ -1428,7 +1683,7 @@ def parseCapture(config, parser):
     # If the option is absent from the config, fall back to the class default.
     save_requested = parser.getboolean(section, "save_frames", fallback=config.save_frames)
     if save_requested and not config.ffmpeg_binary:
-        print("save_frames requested but FFmpeg not available - disabling.")
+        log.warning("save_frames requested but FFmpeg not available - disabling.")
         config.save_frames = False
     else:
         config.save_frames = save_requested
@@ -1443,8 +1698,7 @@ def parseCapture(config, parser):
         # Must be an integer between 0 and 100
         if not 0 <= config.jpgs_quality <= 100:
             config.jpgs_quality = 90
-            print()
-            print("WARNING! The jpgs_quality must be between 0 and 100. It has been reset to 90!")
+            log.warning("The jpgs_quality must be between 0 and 100. It has been reset to 90!")
 
     # Load the PNG compression
     if parser.has_option(section, "png_compression"):
@@ -1453,8 +1707,7 @@ def parseCapture(config, parser):
         # Must be an integer between 0 and 9
         if not 0 <= config.png_compression <= 9:
             config.png_compression = 3
-            print()
-            print("WARNING! The png_compression must be between 0 and 9. It has been reset to 3!")
+            log.warning("The png_compression must be between 0 and 9. It has been reset to 3!")
 
 
     # Load the interval for saving video frame
@@ -1473,6 +1726,18 @@ def parseCapture(config, parser):
     # Enable/disable auto reprocessing
     if parser.has_option(section, "auto_reprocess"):
         config.auto_reprocess = parser.getboolean(section, "auto_reprocess")
+
+    # Load the cap on failed auto-reprocess attempts per capture directory
+    if parser.has_option(section, "auto_reprocess_max_attempts"):
+        config.auto_reprocess_max_attempts = int(parser.get(section, "auto_reprocess_max_attempts"))
+
+        if config.auto_reprocess_max_attempts < 0:
+            config.auto_reprocess_max_attempts = 0
+
+    # Enable/disable reprocessing nights whose ArchivedFiles directory is missing
+    if parser.has_option(section, "reprocess_if_archive_missing"):
+        config.reprocess_if_archive_missing = parser.getboolean(section,
+            "reprocess_if_archive_missing")
 
     # Load name of the capture resume flag file
     if parser.has_option(section, "capture_resume_flag_file"):
@@ -1607,9 +1872,9 @@ def parseBuildArgs(config, parser):
         win_pc_weave = parser.get(section, "win_pc_weave").split()
         
 
-    # Read in the KHT library path for both the PC and the RPi, but decide which one to take based on the 
-    # system this is running on
-    config.extra_compile_args = choosePlatform(win_pc_weave, rpi_weave, linux_pc_weave)
+    # Pick the compile arguments for the system this is running on, keeping the
+    # defaults for any option not set in the config file
+    config.extra_compile_args = getCompileArgs(win_pc_weave, rpi_weave, linux_pc_weave)
 
 
 
@@ -1721,8 +1986,7 @@ def parseMeteorDetection(config, parser):
         # Check that the given bin size is a factor of 2
         if bin_factor > 1:
             if math.log(bin_factor, 2)/int(math.log(bin_factor, 2)) != 1:
-                print('Warning! The given binning factor is not a factor of 2!')
-                print('Defaulting to 1...')
+                log.warning('The given binning factor is not a factor of 2! Defaulting to 1...')
                 bin_factor = 1
         
         config.detection_binning_factor = bin_factor
@@ -1733,8 +1997,8 @@ def parseMeteorDetection(config, parser):
 
         bin_method_list = ['sum', 'avg']
         if bin_method not in bin_method_list:
-            print('Warning! The binning method {:s} is not an allowed binning method: ', bin_method_list)
-            print('Defaulting to avg...')
+            log.warning('The binning method {:s} is not an allowed binning method: {}. '
+                        'Defaulting to avg...'.format(bin_method, bin_method_list))
             bin_method = 'avg'
 
         config.detection_binning_method = bin_method
@@ -1776,6 +2040,10 @@ def parseMeteorDetection(config, parser):
     # Load the background reservoir size
     if parser.has_option(section, "background_reservoir_size"):
         config.background_reservoir_size = parser.getint(section, "background_reservoir_size")
+
+    # Number of threads of the background of the frame chunks
+    if parser.has_option(section, "median_threads"):
+        config.median_threads = parser.getint(section, "median_threads")
 
     if parser.has_option(section, "kht_n_sigmas"):
         config.kht_n_sigmas = parser.getfloat(section, "kht_n_sigmas")
@@ -1884,22 +2152,10 @@ def parseMeteorDetection(config, parser):
     if parser.has_option(section, "max_points_det"):
         config.max_points_det = parser.getint(section, "max_points_det")
 
-    
-    # Read in the KHT library path for both the PC and the RPi, but decide which one to take based on the 
-    # system this is running on
-
-    if parser.has_option(section, "kht_build_dir"):
-        config.kht_build_dir = parser.get(section, "kht_build_dir")
-
-    if parser.has_option(section, "kht_binary_name"):
-        config.kht_binary_name = parser.get(section, "kht_binary_name")
-
-    if parser.has_option(section, "kht_binary_extension"):
-        config.kht_binary_extension = parser.get(section, "kht_binary_extension")
-
-    config.kht_lib_path = findBinaryPath(config, config.kht_build_dir, config.kht_binary_name, 
-        config.kht_binary_extension)
-
+    # Note: the legacy kht_build_dir / kht_binary_name / kht_binary_extension options are
+    # no longer used. KHT is now a regular Cython extension (RMS.Routines.Kht) imported
+    # through the normal Python import machinery, so these options are silently ignored if
+    # present in an existing config file.
 
     if parser.has_option(section, "vect_angle_thresh"):
         config.vect_angle_thresh = parser.getint(section, "vect_angle_thresh")
@@ -2084,7 +2340,7 @@ def parseCalibration(config, parser):
         # If they're all zero, use the V band
         if all([x == 0 for x in config.star_catalog_band_ratios]):
             config.star_catalog_band_ratios[1] = 1.0
-            print('Warning! All band ratios are zero! Using the V band as the default band ratio...')
+            log.warning('All band ratios are zero! Using the V band as the default band ratio...')
 
 
     if parser.has_option(section, "platepar_name"):
@@ -2104,6 +2360,28 @@ def parseCalibration(config, parser):
 
     if parser.has_option(section, "remote_platepar_dir"):
         config.remote_platepar_dir = parser.get(section, "remote_platepar_dir")
+
+    # The model of a platepar fitted from scratch. An unknown distortion type keeps the default, as every fit would
+    #   fail with it
+    if parser.has_option(section, "platepar_distortion_type"):
+        distortion_type = parser.get(section, "platepar_distortion_type").strip()
+        if distortion_type in PLATEPAR_DISTORTION_TYPES:
+            config.platepar_distortion_type = distortion_type
+        else:
+            log.warning("Unknown platepar_distortion_type '{:s}', using {:s}. Options: {:s}".format(
+                distortion_type, config.platepar_distortion_type, ", ".join(PLATEPAR_DISTORTION_TYPES)))
+
+    if parser.has_option(section, "platepar_equal_aspect"):
+        config.platepar_equal_aspect = parser.getboolean(section, "platepar_equal_aspect")
+
+    if parser.has_option(section, "platepar_asymmetry_corr"):
+        config.platepar_asymmetry_corr = parser.getboolean(section, "platepar_asymmetry_corr")
+
+    if parser.has_option(section, "platepar_decentering_corr"):
+        config.platepar_decentering_corr = parser.getboolean(section, "platepar_decentering_corr")
+
+    if parser.has_option(section, "platepar_force_distortion_centre"):
+        config.platepar_force_distortion_centre = parser.getboolean(section, "platepar_force_distortion_centre")
 
     if parser.has_option(section, "catalog_mag_limit"):
         config.catalog_mag_limit = parser.getfloat(section, "catalog_mag_limit")
@@ -2125,6 +2403,13 @@ def parseCalibration(config, parser):
 
     if parser.has_option(section, "recalibration_max_stars"):
         config.recalibration_max_stars = parser.getint(section, "recalibration_max_stars")
+
+    if parser.has_option(section, "recalibration_min_match_fraction"):
+        config.recalibration_min_match_fraction = parser.getfloat(
+            section, "recalibration_min_match_fraction")
+
+    if parser.has_option(section, "recalibration_lsq_refine"):
+        config.recalibration_lsq_refine = parser.getboolean(section, "recalibration_lsq_refine")
 
     if parser.has_option(section, "mask_download_permissive"):
         config.mask_download_permissive = parser.getboolean(section, "mask_download_permissive")
@@ -2180,6 +2465,143 @@ def parseTimelapse(config, parser):
 
     if parser.has_option(section, "timelapse_generate_from_frames"):
         config.timelapse_generate_from_frames = parser.getboolean(section, "timelapse_generate_from_frames")
+
+
+# When the monitor generates the night reports, see monitor_report_mode
+MONITOR_REPORT_MODES = ('sunrise', 'idle', 'external', 'none')
+
+
+def parseMatchedFilter(config, parser):
+    section = "MatchedFilter"
+
+    if not parser.has_section(section):
+        return
+
+    for name in ("mf_enable", "mf_velocity_search", "mf_replace_detection", "mf_cloud_filter", "mf_streak_search"):
+        if parser.has_option(section, name):
+            setattr(config, name, parser.getboolean(section, name))
+
+    if parser.has_option(section, "mf_run_frames"):
+        run_frames = [int(v) for v in parser.get(section, "mf_run_frames").split(",") if v.strip()]
+        if run_frames and all(v > 0 for v in run_frames):
+            config.mf_run_frames = run_frames
+        else:
+            print("Invalid mf_run_frames, using {:s}".format(str(config.mf_run_frames)))
+
+    for name in ("mf_block_frames", "mf_slow_run_frames", "mf_min_hits",
+                 "mf_max_measure_frames", "mf_min_centroids", "mf_edge_margin", "mf_min_frames", "mf_threads",
+                 "mf_smooth_frames", "mf_saturation_level", "mf_max_tracks", "mf_link_max_gap", "mf_max_bin",
+                 "mf_cloud_min_matched", "mf_segment_overlap", "mf_faint_max_tracks"):
+        if parser.has_option(section, name):
+            setattr(config, name, parser.getint(section, name))
+
+    for name in ("mf_threshold", "mf_ang_vel_min", "mf_ang_vel_max", "mf_psf_sigma", "mf_max_pos_error",
+                 "mf_min_sample_snr", "mf_star_threshold", "mf_persistence", "mf_clip", "mf_trail_level", "mf_min_displacement",
+                 "mf_sigma_scale", "mf_track_significance", "mf_tier_speed", "mf_cloud_max_offset",
+                 "mf_buffer_memory", "mf_cache_memory", "mf_line_concentration", "mf_track_deviation_fwhm",
+                 "mf_track_deviation_length", "mf_faint_threshold"):
+        if parser.has_option(section, name):
+            setattr(config, name, parser.getfloat(section, name))
+
+    if parser.has_option(section, "mf_gpu"):
+        gpu = parser.get(section, "mf_gpu").strip().lower()
+        if gpu in ("auto", "on", "off"):
+            config.mf_gpu = gpu
+        else:
+            print("Unknown mf_gpu '{:s}', using '{:s}'".format(gpu, config.mf_gpu))
+
+
+def parseMonitorProcessing(config, parser):
+    section = "MonitorProcessing"
+
+    if not parser.has_section(section):
+        return
+
+    if parser.has_option(section, "monitor_save_images"):
+        config.monitor_save_images = parser.getboolean(section, "monitor_save_images")
+
+    if parser.has_option(section, "monitor_report_mode"):
+        report_mode = parser.get(section, "monitor_report_mode").strip().lower()
+
+        if report_mode in MONITOR_REPORT_MODES:
+            config.monitor_report_mode = report_mode
+        else:
+            print("Unknown monitor_report_mode '{:s}', using '{:s}'".format(report_mode,
+                config.monitor_report_mode))
+
+    if parser.has_option(section, "monitor_report_quiet_min"):
+        config.monitor_report_quiet_min = parser.getfloat(section, "monitor_report_quiet_min")
+
+    if parser.has_option(section, "monitor_partial_report_time"):
+        partial_time = parser.get(section, "monitor_partial_report_time").strip()
+
+        try:
+            if partial_time:
+                datetime.datetime.strptime(partial_time, "%H:%M")
+            config.monitor_partial_report_time = partial_time
+
+        except ValueError:
+            print("Invalid monitor_partial_report_time '{:s}' (HH:MM expected), partial reports are "
+                  "disabled".format(partial_time))
+
+    if parser.has_option(section, "monitor_night_cutoff_hours"):
+        config.monitor_night_cutoff_hours = parser.getfloat(section, "monitor_night_cutoff_hours")
+
+    if parser.has_option(section, "monitor_upload"):
+        config.monitor_upload = parser.getboolean(section, "monitor_upload")
+
+    if parser.has_option(section, "monitor_delete_images_days"):
+        config.monitor_delete_images_days = parser.getfloat(section, "monitor_delete_images_days")
+
+    if parser.has_option(section, "monitor_delete_old_data"):
+        config.monitor_delete_old_data = parser.getboolean(section, "monitor_delete_old_data")
+
+    if parser.has_option(section, "monitor_update_platepar"):
+        config.monitor_update_platepar = parser.getboolean(section, "monitor_update_platepar")
+
+    if parser.has_option(section, "monitor_auto_calibration"):
+        config.monitor_auto_calibration = parser.getboolean(section, "monitor_auto_calibration")
+
+    if parser.has_option(section, "monitor_auto_calibration_interval"):
+        config.monitor_auto_calibration_interval = parser.getfloat(section, "monitor_auto_calibration_interval")
+
+    if parser.has_option(section, "monitor_auto_calibration_fit_vignetting"):
+        config.monitor_auto_calibration_fit_vignetting = parser.getboolean(section,
+                                                                           "monitor_auto_calibration_fit_vignetting")
+
+    if parser.has_option(section, "monitor_auto_calibration_dry_run"):
+        config.monitor_auto_calibration_dry_run = parser.getboolean(section, "monitor_auto_calibration_dry_run")
+
+    if parser.has_option(section, "monitor_save_ecsv"):
+        config.monitor_save_ecsv = parser.getboolean(section, "monitor_save_ecsv")
+
+    if parser.has_option(section, "monitor_shower_association"):
+        config.monitor_shower_association = parser.getboolean(section, "monitor_shower_association")
+
+    if parser.has_option(section, "monitor_fov_kml"):
+        config.monitor_fov_kml = parser.getboolean(section, "monitor_fov_kml")
+
+    if parser.has_option(section, "monitor_flux"):
+        config.monitor_flux = parser.getboolean(section, "monitor_flux")
+
+    if parser.has_option(section, "monitor_observation_summary"):
+        config.monitor_observation_summary = parser.getboolean(section, "monitor_observation_summary")
+
+    if parser.has_option(section, "monitor_continuous"):
+        config.monitor_continuous = parser.getboolean(section, "monitor_continuous")
+
+    if parser.has_option(section, "monitor_continuous_chunks"):
+        config.monitor_continuous_chunks = max(parser.getint(section, "monitor_continuous_chunks"), 1)
+
+    if parser.has_option(section, "monitor_staging_dir"):
+        staging_dir = parser.get(section, "monitor_staging_dir").strip()
+        config.monitor_staging_dir = os.path.expanduser(staging_dir) if staging_dir else ''
+
+    if parser.has_option(section, "monitor_status"):
+        config.monitor_status = parser.getboolean(section, "monitor_status")
+
+    if parser.has_option(section, "monitor_status_interval"):
+        config.monitor_status_interval = max(parser.getfloat(section, "monitor_status_interval"), 1.0)
 
 
 def parseColors(config, parser):

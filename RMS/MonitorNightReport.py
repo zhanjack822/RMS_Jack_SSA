@@ -1,0 +1,2641 @@
+""" Night reports for data processed by RMS.MonitorProcessFrameInterface.
+
+The monitor processes every input file into its own results directory (CALSTARS, FTPdetectinfo, recalibrated
+platepars, and a done.flag with the night the file belongs to), and saves the max pixel and average pixel
+images of every star extraction chunk as FF-equivalent image pairs into a night directory, laid out like the
+data directory of a normal RMS station:
+
+    <output_dir>/CapturedFiles/<STATION>_<YYYYMMDD>_<HHMMSS>_000000/
+
+The time in the name is the beginning of the night (sunset). The night report merges the results of all files
+of the night into the night directory and generates the products of a normal RMS night: the calibration report
+and plots, thumbnails, stacks, timelapse, optional products (shower association, FOV KML, flux, observation
+summary), and the archive in ArchivedFiles. The most confident platepar of the night is carried forward to the
+following data. The report state of all nights is kept in the output directory (REPORT_STATE_FILE_NAME), so it
+survives the deletion of old night directories.
+
+The report can be run from the command line:
+
+    python -m RMS.MonitorNightReport <output_dir> [--night NIGHT] [--all] [--config CONFIG] [--no_archive]
+"""
+
+from __future__ import print_function, division, absolute_import
+
+import argparse
+import bisect
+import collections
+import contextlib
+import copy
+import csv
+import datetime
+import glob
+import json
+import multiprocessing
+import os
+import platform
+import re
+import shutil
+import signal
+import sys
+import threading
+import time
+import traceback
+
+import ephem
+import numpy as np
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+import RMS.ConfigReader as cr
+from RMS.Astrometry.ApplyAstrometry import raDecToXYPP
+from RMS.CaptureDuration import CAPTURE_HORIZON_DEG
+from RMS.DeleteOldObservations import availableSpace, deleteOldLogfiles, deleteOldObservations, getNightDirs
+from RMS.Formats import CALSTARS
+from RMS.Formats import FFpng
+from RMS.Formats import FTPdetectinfo
+from RMS.Formats.FFfile import filenameToDatetime, validFFName
+from RMS.Formats.Platepar import Platepar
+from RMS.Logger import getLogger, LoggingManager
+from RMS.Misc import RmsDateTime, getRMSStyleFileName
+from RMS.Routines.MaskImage import loadMask
+
+
+log = getLogger("logger")
+
+
+# Name of the flag file which marks a processed input file in its results directory
+DONE_FLAG_NAME = 'done.flag'
+
+# Report state of all nights, kept in the output directory
+REPORT_STATE_FILE_NAME = '.night_reports.json'
+
+# Lock file which lets only one monitor (or command line report) work on an output directory at a time
+MONITOR_LOCK_FILE_NAME = '.monitor.lock'
+
+# Creating this file in the output directory triggers the reports of all nights with new data
+REPORT_TRIGGER_FILE_NAME = '.report_now'
+
+# Directory in the night directory with the ECSV files of the detections
+ECSV_DIR_NAME = 'ECSV'
+
+# Time format used in the JSON files
+JSON_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S.%f"
+
+# Time limits (seconds) of a night report and of the cleanup, after which they are stopped (e.g. stuck on a
+#   file system or in an external program), so they don't block the following reports and cleanups
+REPORT_TIMEOUT = 4*3600
+CLEANUP_TIMEOUT = 3600
+
+# Report steps which decide if a night is reported. Failed optional products are only logged, as in a normal
+#   RMS night, so they don't block the night from being reported and uploaded
+ESSENTIAL_STEPS = {'merge', 'archive', 'thumbnails_and_stacks'}
+
+
+# Merged results of a night
+# A night report warns if fewer than this share of the chunks could be recalibrated
+RECALIBRATION_WARNING_SHARE = 0.5
+
+MergedNight = collections.namedtuple('MergedNight', ['calstars_name', 'ftpdetectinfo_name', 'fps',
+    'chunk_frames', 'ff_detected', 'n_meteors', 'recalibrated'])
+
+
+
+### Night naming ###
+
+def nightInfo(config, dt):
+    """ Determine the night which the given time belongs to.
+
+    A night spans from one local solar noon to the next, so a time always belongs to exactly one night,
+    including at dusk and in polar regions. The night is named after the sunset at the capture horizon
+    following the noon, and ends at the following sunrise, at the latest at the next noon. If the Sun doesn't
+    set before the next noon (polar day or night), the night is named after the noon.
+
+    Arguments:
+        config: [Config] Configuration with the station coordinates.
+        dt: [datetime] Time (UTC).
+
+    Return:
+        (night_name, night_start, night_end): [tuple]
+            - night_name: [str] Name of the night directory, e.g. XX0001_20251224_163212_000000.
+            - night_start: [datetime] Beginning of the night (UTC).
+            - night_end: [datetime] End of the night (UTC).
+    """
+
+    o = ephem.Observer()
+    o.lat = str(config.latitude)
+    o.long = str(config.longitude)
+    o.elevation = config.elevation
+    o.date = dt
+
+    sun = ephem.Sun()
+
+    # Local solar noon before the given time. Transits always exist, even in polar regions
+    noon = o.previous_transit(sun).datetime()
+
+    o.date = noon
+    o.horizon = CAPTURE_HORIZON_DEG
+
+    next_noon = noon + datetime.timedelta(days=1)
+
+    try:
+        night_start = o.next_setting(sun).datetime()
+
+        o.date = night_start
+        night_end = o.next_rising(sun).datetime()
+
+    except (ephem.NeverUpError, ephem.AlwaysUpError):
+        night_start = noon
+        night_end = next_noon
+
+    # Close to the polar day or night, the next sunset can be after the next noon, and the next sunrise days
+    #   later. The night still ends at the next noon, and is named after the noon if the Sun doesn't set
+    #   before
+    if night_start >= next_noon:
+        night_start = noon
+
+    night_end = min(night_end, next_noon)
+
+    night_name = "{:s}_{:s}_000000".format(config.stationID, night_start.strftime("%Y%m%d_%H%M%S"))
+
+    return night_name, night_start, night_end
+
+
+def nightBoundsFromName(config, night_name):
+    """ Return the beginning and the end of the night with the given name.
+
+    Arguments:
+        config: [Config] Configuration with the station coordinates.
+        night_name: [str] Name of the night.
+
+    Return:
+        (night_start, night_end): [tuple of datetime]
+    """
+
+    # The time in the name is the beginning of the night, so a minute later is inside the night
+    night_start = datetime.datetime.strptime("_".join(night_name.split('_')[-3:-1]), "%Y%m%d_%H%M%S")
+
+    _, night_start, night_end = nightInfo(config, night_start + datetime.timedelta(minutes=1))
+
+    return night_start, night_end
+
+
+def lockOutputDir(output_dir):
+    """ Lock the output directory, so a second monitor (e.g. started by mistake) or a command line report
+        can't work on it at the same time. The lock is released when the process ends, also if it is killed,
+        so it never goes stale. It is a POSIX record lock, which belongs to this process only, so child
+        processes which outlive it (e.g. the upload manager) don't keep the directory locked.
+
+    Arguments:
+        output_dir: [str] Output directory of the monitor.
+
+    Return:
+        [file] The open lock file, which has to stay open while the directory is used. None if the directory
+            is locked by another process.
+    """
+
+    lock_file = open(os.path.join(output_dir, MONITOR_LOCK_FILE_NAME), 'a+')
+
+    # Locking is not available on all platforms
+    if fcntl is None:
+        return lock_file
+
+    try:
+        fcntl.lockf(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    except (IOError, OSError):
+        lock_file.close()
+        return None
+
+    # Note the PID of the lock owner, for the error message of the next one
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write("{:d}\n".format(os.getpid()))
+    lock_file.flush()
+
+    return lock_file
+
+
+def lockOwner(output_dir):
+    """ Return the PID of the process which locked the output directory, as noted in the lock file. """
+
+    with open(os.path.join(output_dir, MONITOR_LOCK_FILE_NAME)) as f:
+        return f.read().strip()
+
+
+def partialReportTime(config, night_name):
+    """ Time of the partial report of the night, the first monitor_partial_report_time after the beginning
+        of the night.
+
+    Arguments:
+        config: [Config] Configuration.
+        night_name: [str] Name of the night.
+
+    Return:
+        [datetime] Time of the partial report (UTC), None if partial reports are disabled.
+    """
+
+    if not config.monitor_partial_report_time:
+        return None
+
+    night_start, _ = nightBoundsFromName(config, night_name)
+
+    report_time = datetime.datetime.strptime(config.monitor_partial_report_time, "%H:%M")
+    partial_time = night_start.replace(hour=report_time.hour, minute=report_time.minute, second=0,
+                                       microsecond=0)
+    if partial_time <= night_start:
+        partial_time += datetime.timedelta(days=1)
+
+    return partial_time
+
+
+def nightDirPath(output_dir, night_name, config):
+    """ Path of the night directory with the image pairs and the merged results.
+
+    Arguments:
+        output_dir: [str] Output directory of the monitor.
+        night_name: [str] Name of the night.
+        config: [Config] Configuration.
+
+    Return:
+        [str] Path of the night directory.
+    """
+
+    return os.path.join(output_dir, config.captured_dir, night_name)
+
+
+def latestPlateparPath(output_dir, config):
+    """ Path of the best platepar of the latest reported night, which is used for the following data. It has
+        its own name, so the platepar given to the monitor is never overwritten.
+
+    Arguments:
+        output_dir: [str] Output directory of the monitor.
+        config: [Config] Configuration.
+
+    Return:
+        [str] Path of the platepar.
+    """
+
+    return os.path.join(output_dir, 'latest_' + config.platepar_name)
+
+
+def autoPlateparPath(output_dir, config):
+    """ Path of the platepar fitted by the automatic calibration (monitor_auto_calibration). It has its own name,
+        so the platepar given to the monitor is never overwritten.
+
+    Arguments:
+        output_dir: [str] Output directory of the monitor.
+        config: [Config] Configuration.
+
+    Return:
+        [str] Path of the platepar.
+    """
+
+    return os.path.join(output_dir, 'auto_' + config.platepar_name)
+
+
+
+### Done flags and report state ###
+
+def selectPlatepar(output_dir, config, platepar_path):
+    """ The platepar which the files are processed with: the newest of the given platepar, the best platepar of
+        the latest reported night (see latestPlateparPath) if it is carried forward (monitor_update_platepar),
+        and the platepar fitted by the automatic calibration (see autoPlateparPath) if it is enabled
+        (monitor_auto_calibration). A given platepar newer than the others (e.g. it was fitted again manually)
+        is used.
+
+    Arguments:
+        output_dir: [str] Output directory of the monitor.
+        config: [Config] Configuration.
+        platepar_path: [str] Path of the platepar given to the monitor. It may not exist (or be None) with the
+            automatic calibration, until a platepar is fitted.
+
+    Return:
+        [str] Path of the platepar, None if there is none.
+    """
+
+    # The platepars which can be used: the given one, and the carried forward and the automatically fitted
+    #   one if they are enabled
+    candidates = [platepar_path]
+    if config.monitor_update_platepar:
+        candidates.append(latestPlateparPath(output_dir, config))
+    if config.monitor_auto_calibration:
+        candidates.append(autoPlateparPath(output_dir, config))
+
+    # The newest existing platepar. With equal times the earlier candidate is kept, so the given platepar wins
+    #   a tie
+    selected = None
+    for path in candidates:
+        if (path is not None) and os.path.isfile(path) \
+                and ((selected is None) or (os.path.getmtime(path) > os.path.getmtime(selected))):
+            selected = path
+
+    return selected
+
+
+def _writeJSON(file_path, data):
+    """ Write JSON to a temporary file and rename it, so a reader never sees a partially written file. """
+
+    tmp_path = file_path + '.tmp'
+    with open(tmp_path, 'w') as f:
+        json.dump(data, f, indent=4, sort_keys=True)
+
+        # Make sure the data is on the disk before the rename, so a power loss doesn't leave a broken file
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.replace(tmp_path, file_path)
+
+
+def readStateFile(file_path, default):
+    """ Read a JSON state file of the monitor. A damaged file (e.g. after a disk error) is moved aside to
+        <name>.corrupt, and the monitor starts over with the default instead of failing at every start.
+
+    Arguments:
+        file_path: [str] Path of the state file.
+        default: [object] State returned if the file doesn't exist or is damaged.
+
+    Return:
+        [object] The state.
+    """
+
+    if not os.path.isfile(file_path):
+        return default
+
+    try:
+        with open(file_path) as f:
+            return json.load(f)
+
+    except ValueError:
+        log.warning("The state file {:s} is damaged, it was moved to {:s}.corrupt and the monitor starts "
+                    "over".format(file_path, file_path))
+        os.replace(file_path, file_path + '.corrupt')
+
+        return default
+
+
+def writeDoneFlag(results_dir, info):
+    """ Mark a results directory as processed. The flag contains the given info as JSON.
+
+    Arguments:
+        results_dir: [str] Results directory of an input file.
+        info: [dict] Info about the processed file: night, mask_path, dark_applied, flat_applied. A file which
+            was skipped by the cutoff of its night has only night and skipped.
+    """
+
+    _writeJSON(os.path.join(results_dir, DONE_FLAG_NAME), info)
+
+
+def readDoneFlag(results_dir):
+    """ Read the info from the done flag of a results directory.
+
+    Arguments:
+        results_dir: [str] Results directory of an input file.
+
+    Return:
+        [dict] Info stored in the flag. Empty if the flag is empty (results from before the night reports).
+    """
+
+    try:
+        with open(os.path.join(results_dir, DONE_FLAG_NAME)) as f:
+            return json.load(f)
+
+    except ValueError:
+        return {}
+
+
+def scanNights(output_dir, config, cache=None):
+    """ Find the results of all processed files, grouped by night.
+
+    Arguments:
+        output_dir: [str] Output directory of the monitor.
+        config: [Config] Configuration.
+
+    Keyword arguments:
+        cache: [dict] Done flags of the previous scan, {results_dir: (mtime_ns, info)}, which the caller keeps
+            between scans and this function updates. Results directories which didn't change since the
+            previous scan are not read again, so a scan of months of results takes one stat per file. None by
+            default (everything is read).
+
+    Return:
+        [dict] {night_name: {results_dir: info}}, where results_dir is relative to the output directory and
+            info is the content of its done flag. Results from before the night reports and files skipped by
+            the cutoff of their night are not included.
+    """
+
+    nights = {}
+    scanned = {}
+
+    def _addResults(results_dir, info):
+        # Files skipped by the cutoff of their night have no results
+        if ('night' in info) and (not info.get('skipped')):
+            nights.setdefault(info['night'], {})[results_dir] = info
+
+    def _scanDir(dir_path, results_dir, mtime_ns):
+        try:
+            entries = list(os.scandir(dir_path))
+        except OSError:
+            return
+
+        names = set(entry.name for entry in entries)
+
+        # Don't descend into the output directory of another monitor
+        if (dir_path != output_dir) and (MONITOR_LOCK_FILE_NAME in names):
+            return
+
+        # Results directories don't contain other results
+        if DONE_FLAG_NAME in names:
+            info = readDoneFlag(dir_path)
+            scanned[results_dir] = (mtime_ns, info)
+            _addResults(results_dir, info)
+            return
+
+        for entry in entries:
+
+            # Don't descend into the night, archive and log directories
+            if (dir_path == output_dir) \
+                    and (entry.name in (config.captured_dir, config.archived_dir, 'logs')):
+                continue
+
+            try:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                entry_mtime = entry.stat(follow_symlinks=False).st_mtime_ns
+            except OSError:
+                continue
+
+            entry_results_dir = os.path.relpath(entry.path, output_dir)
+
+            # A results directory which didn't change since the previous scan. Writing the done flag (which
+            #   is replaced atomically) and pruning change the time of the directory
+            if (cache is not None) and (cache.get(entry_results_dir, (None,))[0] == entry_mtime):
+                scanned[entry_results_dir] = cache[entry_results_dir]
+                _addResults(entry_results_dir, cache[entry_results_dir][1])
+                continue
+
+            _scanDir(entry.path, entry_results_dir, entry_mtime)
+
+    _scanDir(output_dir, '.', None)
+
+    if cache is not None:
+        cache.clear()
+        cache.update(scanned)
+
+    return nights
+
+
+def readReportStates(output_dir):
+    """ Read the report state of all nights.
+
+    Arguments:
+        output_dir: [str] Output directory of the monitor.
+
+    Return:
+        [dict] {'nights': {night_name: {files, files_time, reported_at, failed_steps, upload_files}},
+            'latest_platepar_night': night_name}
+    """
+
+    # A damaged state makes all nights be reported again
+    return readStateFile(os.path.join(output_dir, REPORT_STATE_FILE_NAME),
+                         {'nights': {}, 'latest_platepar_night': None})
+
+
+@contextlib.contextmanager
+def reportStateLock(output_dir):
+    """ Lock the report states for a read-modify-write, as the report and the cleanup processes, which can
+        run at the same time, both update them.
+
+    Arguments:
+        output_dir: [str] Output directory of the monitor.
+    """
+
+    with open(os.path.join(output_dir, REPORT_STATE_FILE_NAME + '.lock'), 'a') as lock_file:
+
+        if fcntl is not None:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+
+        yield
+
+
+def updateReportState(output_dir, night_name=None, latest_platepar_night=None, **night_state):
+    """ Update the report state of a night and/or the night of the latest platepar.
+
+    Arguments:
+        output_dir: [str] Output directory of the monitor.
+
+    Keyword arguments:
+        night_name: [str] Night whose state is updated with the given night_state values. None by default.
+        latest_platepar_night: [str] Night of the latest carried forward platepar. None by default.
+        **night_state: Values of the night state to update, e.g. files, reported_at, failed_steps,
+            upload_files.
+    """
+
+    with reportStateLock(output_dir):
+
+        states = readReportStates(output_dir)
+
+        if night_name is not None:
+            states['nights'].setdefault(night_name, {}).update(night_state)
+
+        if latest_platepar_night is not None:
+            states['latest_platepar_night'] = latest_platepar_night
+
+        _writeJSON(os.path.join(output_dir, REPORT_STATE_FILE_NAME), states)
+
+
+def doneTime(output_dir, results_dir):
+    """ Return the time (UTC) when the processing of a file was finished, from the time of its done flag.
+
+    Arguments:
+        output_dir: [str] Output directory of the monitor.
+        results_dir: [str] Results directory, relative to the output directory.
+
+    Return:
+        [datetime] Naive UTC time.
+    """
+
+    mtime = os.path.getmtime(os.path.join(output_dir, results_dir, DONE_FLAG_NAME))
+
+    return datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc).replace(tzinfo=None)
+
+
+def unreportedResults(output_dir, states, night_name, results):
+    """ Return the results of the night which were not included in its last successful report, or which were
+        finished again after that report started (e.g. the file was processed again with --force).
+
+    Arguments:
+        output_dir: [str] Output directory of the monitor.
+        states: [dict] Report states, see readReportStates.
+        night_name: [str] Name of the night.
+        results: [dict] {results_dir: info} of the night, see scanNights.
+
+    Return:
+        [list] Unreported results directories.
+    """
+
+    night_state = states['nights'].get(night_name, {})
+    reported = set(night_state.get('files', []))
+
+    # Time when the last successful report took its results. Older states only have the end of the report
+    files_time = night_state.get('files_time', night_state.get('reported_at'))
+    if files_time is not None:
+        files_time = datetime.datetime.strptime(files_time, JSON_TIME_FORMAT)
+
+    return [results_dir for results_dir in results if (results_dir not in reported)
+            or ((files_time is not None) and (doneTime(output_dir, results_dir) > files_time))]
+
+
+def isPending(output_dir, config, states, night_name, results):
+    """ Check if the night has to be reported: it has unreported files, and its directory was not deleted by
+        the cleanup (old nights are not reported again, as their archives would have no images, and their
+        results are pruned).
+
+    Arguments:
+        output_dir: [str] Output directory of the monitor.
+        config: [Config] Configuration.
+        states: [dict] Report states, see readReportStates.
+        night_name: [str] Name of the night.
+        results: [dict] {results_dir: info} of the night, see scanNights.
+
+    Return:
+        [bool]
+    """
+
+    # Deleted nights and nights whose images were deleted are not reported again
+    night_state = states['nights'].get(night_name, {})
+    if night_state.get('deleted') or night_state.get('images_deleted'):
+        return False
+
+    return bool(unreportedResults(output_dir, states, night_name, results)) \
+        and os.path.isdir(nightDirPath(output_dir, night_name, config))
+
+
+
+### Night products ###
+
+def detectedImageNames(meteor_list, image_names):
+    """ Return the names of all images which cover the duration of the detected meteors. A meteor longer than
+        one chunk is spread over several images, so all images from the one with the first pick (the FF name
+        of the meteor) to the one with the last pick are returned.
+
+    Arguments:
+        meteor_list: [list] Meteors as [ff_name, meteor_No, rho, phi, meteor_meas, meteor_fps, ...], where the
+            first element of every measurement is the frame relative to the beginning of the FF file.
+        image_names: [list] FF names of the images in the night directory.
+
+    Return:
+        [list] Sorted FF names of the images covering the meteors.
+    """
+
+    # Every image covers the time from its beginning to the beginning of the next image
+    image_names = sorted(image_names, key=filenameToDatetime)
+    image_times = [filenameToDatetime(file_name) for file_name in image_names]
+    image_index = {file_name: i for i, file_name in enumerate(image_names)}
+
+    detected = set()
+    for meteor in meteor_list:
+        ff_name, meteor_meas, meteor_fps = meteor[0], meteor[4], meteor[5]
+
+        if ff_name not in image_index:
+            continue
+
+        first = image_index[ff_name]
+
+        # Find the image with the last pick
+        last_frame = max(line[0] for line in meteor_meas)
+        last_time = image_times[first] + datetime.timedelta(seconds=last_frame/meteor_fps)
+        last = max(first, bisect.bisect_right(image_times, last_time) - 1)
+
+        detected.update(image_names[first:last + 1])
+
+    return sorted(detected)
+
+
+def mergeNightResults(night_dir, output_dir, results, config):
+    """ Merge the CALSTARS, FTPdetectinfo and recalibrated platepars of all files of the night into one file
+        each in the night directory, collect the ECSV files into its ECSV directory, and copy the platepar,
+        the config and the mask there.
+
+    Arguments:
+        night_dir: [str] Night directory.
+        output_dir: [str] Output directory of the monitor.
+        results: [dict] {results_dir: info} of the night, see scanNights.
+        config: [Config] Configuration.
+
+    Return:
+        [MergedNight] Merged results.
+    """
+
+    night_name = os.path.basename(night_dir)
+    results_paths = [os.path.join(output_dir, results_dir) for results_dir in sorted(results)]
+
+    # Remove merged files from a previous report, so the directory always contains exactly one of each
+    for file_name in os.listdir(night_dir):
+        if file_name.startswith(('CALSTARS_', 'FTPdetectinfo_')) and file_name.endswith('.txt'):
+            os.remove(os.path.join(night_dir, file_name))
+
+
+    ### Merge CALSTARS ###
+
+    star_list = []
+    chunk_frames = None
+    fps = None
+
+    for results_path in results_paths:
+        for calstars_path in glob.glob(os.path.join(results_path, 'CALSTARS_*.txt')):
+
+            stars, chunk_frames, fps = CALSTARS.readCALSTARS(results_path, os.path.basename(calstars_path),
+                                                             return_fps=True)
+            star_list += stars
+
+    calstars_name = None
+    if star_list:
+        calstars_name = 'CALSTARS_{:s}.txt'.format(night_name)
+        CALSTARS.writeCALSTARS(sorted(star_list, key=lambda entry: entry[0]), night_dir, calstars_name,
+                               config.stationID, config.height, config.width, chunk_frames=chunk_frames,
+                               fps=fps)
+
+
+    ### Merge FTPdetectinfo ###
+
+    # The meteors of files processed without a platepar (before the automatic calibration fitted one) stay
+    #   uncalibrated, the others are marked as recalibrated
+    calibration = "Recalibrated with RMS on: " + RmsDateTime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f UTC")
+    meteor_list = []
+    for results_path in results_paths:
+
+        ftpdetectinfo_names = [file_name for file_name in sorted(os.listdir(results_path))
+                               if file_name.startswith('FTPdetectinfo_')
+                               and FTPdetectinfo.validDefaultFTPdetectinfo(file_name)]
+
+        for ftpdetectinfo_name in ftpdetectinfo_names:
+
+            # Read the full format to keep the frame rate and the calibration status of every meteor, and
+            #   remove the calibration status from the measurements to get the input format of the writer
+            for entry in FTPdetectinfo.readFTPdetectinfo(results_path, ftpdetectinfo_name):
+                ff_name, _, meteor_No, _, meteor_fps, _, _, _, _, rho, phi, meteor_meas = entry
+                calibrated = all(line[0] == 1 for line in meteor_meas)
+                meteor_list.append([ff_name, meteor_No, rho, phi, [line[1:] for line in meteor_meas],
+                                    meteor_fps, calibration if calibrated else None])
+
+    ftpdetectinfo_name = 'FTPdetectinfo_{:s}.txt'.format(night_name)
+    FTPdetectinfo.writeFTPdetectinfo(sorted(meteor_list, key=lambda entry: (entry[0], entry[1])), night_dir,
+        ftpdetectinfo_name, night_dir, config.stationID, fps if fps else config.fps, calibration=calibration,
+        celestial_coords_given=True)
+
+
+    ### Merge the recalibrated platepars ###
+
+    recalibrated = {}
+    for results_path in results_paths:
+
+        recalibrated_path = os.path.join(results_path, config.platepars_recalibrated_name)
+        if os.path.isfile(recalibrated_path):
+            with open(recalibrated_path) as f:
+                recalibrated.update(json.load(f))
+
+    if recalibrated:
+        _writeJSON(os.path.join(night_dir, config.platepars_recalibrated_name), recalibrated)
+
+
+    ### Collect the ECSV files ###
+
+    # Detections of different files which begin in the same second have ECSV files of the same name, so the
+    #   names are made unique when they are collected into the night directory
+    ecsv_dir = os.path.join(night_dir, ECSV_DIR_NAME)
+    if os.path.isdir(ecsv_dir):
+        shutil.rmtree(ecsv_dir)
+
+    for results_path in results_paths:
+        for ecsv_path in sorted(glob.glob(os.path.join(results_path, '*.ecsv'))):
+
+            os.makedirs(ecsv_dir, exist_ok=True)
+
+            base_name, ext = os.path.splitext(os.path.basename(ecsv_path))
+            file_name = base_name + ext
+            collision = 1
+            while os.path.isfile(os.path.join(ecsv_dir, file_name)):
+                collision += 1
+                file_name = '{:s}_{:d}{:s}'.format(base_name, collision, ext)
+
+            shutil.copy2(ecsv_path, os.path.join(ecsv_dir, file_name))
+
+
+    ### Copy the platepar, the config and the mask ###
+
+    first_results = results_paths[0]
+
+    # The platepar of the latest file which has one: the files processed before the camera was calibrated
+    #   automatically have none, and a platepar fitted again during the night is the one the later files used
+    platepar_results = [path for path in results_paths if os.path.isfile(os.path.join(path, config.platepar_name))]
+    if platepar_results:
+        shutil.copy2(os.path.join(platepar_results[-1], config.platepar_name), night_dir)
+
+    for config_path in glob.glob(os.path.join(first_results, '*.config')):
+        shutil.copy2(config_path, night_dir)
+
+    mask_path = results[sorted(results)[0]].get('mask_path')
+    if mask_path and os.path.isfile(mask_path):
+        shutil.copy2(mask_path, os.path.join(night_dir, config.mask_file))
+
+
+    # Images in the night directory which cover the detections
+    night_ffs = [file_name for file_name in os.listdir(night_dir) if validFFName(file_name)]
+    ff_detected = detectedImageNames(meteor_list, night_ffs)
+
+    return MergedNight(calstars_name, ftpdetectinfo_name, fps, chunk_frames, ff_detected, len(meteor_list),
+                       recalibrated)
+
+
+def plateparResidual(platepar):
+    """ Median distance (px) between the image positions of the stars the platepar was fitted on and their
+        catalog positions projected with the platepar.
+
+    Arguments:
+        platepar: [Platepar instance] Recalibrated platepar (ApplyRecalibrate) with a star list. Its entries
+            are [jd, y, x, intensity, ra, dec, mag], as the image coordinates come from CALSTARS (Y X).
+
+    Return:
+        [float] Median residual in pixels.
+    """
+
+    star_list = np.array(platepar.star_list, dtype=np.float64)
+
+    jd, y, x, ra, dec = star_list[:, 0], star_list[:, 1], star_list[:, 2], star_list[:, 4], star_list[:, 5]
+
+    x_cat, y_cat = raDecToXYPP(ra, dec, np.mean(jd), platepar)
+
+    return float(np.median(np.hypot(x - x_cat, y - y_cat)))
+
+
+def selectBestNightPlatepar(recalibrated, use_flat=False):
+    """ Select the most confident platepar of the night: the successfully recalibrated platepar with the most
+        matched stars, and the lowest residual among those.
+
+    Arguments:
+        recalibrated: [dict] Recalibrated platepars as stored in the JSON file, keyed by the FF name.
+
+    Keyword arguments:
+        use_flat: [bool] Whether the data was flat fielded. False by default.
+
+    Return:
+        (ff_name, platepar, n_stars, residual): [tuple] The selected platepar, None if no platepar was
+            recalibrated successfully.
+    """
+
+    # Number of matched stars of the successfully recalibrated platepars
+    candidates = {ff_name: len(pp_dict['star_list']) for ff_name, pp_dict in recalibrated.items()
+                  if pp_dict.get('auto_recalibrated') and pp_dict.get('star_list')}
+
+    if not candidates:
+        return None
+
+    # Compare the residuals of the platepars with the most stars
+    n_stars = max(candidates.values())
+
+    best = None
+    for ff_name in sorted(ff for ff, n in candidates.items() if n == n_stars):
+
+        platepar = Platepar()
+        platepar.loadFromDict(recalibrated[ff_name], use_flat=use_flat)
+        residual = plateparResidual(platepar)
+
+        if (best is None) or (residual < best[3]):
+            best = (ff_name, platepar, n_stars, residual)
+
+    return best
+
+
+def newestPlateparRecalibrations(output_dir, results, recalibrated, config):
+    """ The recalibrated platepars of the files of a night which were calibrated with the newest platepar of the
+        night (the time of the platepar is in the done flag of every file). Files without the time (processed
+        before it was recorded) are kept if no file has it.
+
+    Arguments:
+        output_dir: [str] Output directory of the monitor.
+        results: [dict] Results of the night, {results_dir: done flag info}.
+        recalibrated: [dict] Recalibrated platepars of the night, keyed by the FF name.
+        config: [Config] Configuration.
+
+    Return:
+        [dict] The recalibrated platepars of those files, keyed by the FF name.
+    """
+
+    # The times of the platepars the files were calibrated with (without them, nothing can be filtered)
+    times = [info.get('platepar_mtime') for info in results.values() if info.get('platepar_mtime') is not None]
+    if not times:
+        return recalibrated
+
+    # The FF names of the recalibrated platepars of the files calibrated with the newest platepar
+    newest = max(times)
+    names = set()
+    for results_dir, info in results.items():
+        if info.get('platepar_mtime') != newest:
+            continue
+
+        # The recalibrated platepars of the file (a damaged file is skipped)
+        recalibrated_path = os.path.join(output_dir, results_dir, config.platepars_recalibrated_name)
+        if os.path.isfile(recalibrated_path):
+            try:
+                with open(recalibrated_path) as f:
+                    names.update(json.load(f).keys())
+
+            except ValueError:
+                continue
+
+    return {name: pp_dict for name, pp_dict in recalibrated.items() if name in names}
+
+
+def _writePlatepar(platepar, file_path):
+    """ Write the platepar to a temporary file and rename it, as other processes may be reading it. """
+
+    platepar.write(file_path + '.tmp', fmt='json')
+    os.replace(file_path + '.tmp', file_path)
+
+
+def saveNightPlatepar(platepar, night_dir, night_name, output_dir, config):
+    """ Save the best platepar of the night to the night directory (as at the end of a normal RMS night), and
+        carry it forward to the following data if monitor_update_platepar is set and no newer night has been
+        reported (e.g. when an old night is reported again).
+
+    Arguments:
+        platepar: [Platepar instance] Best platepar of the night.
+        night_dir: [str] Night directory.
+        night_name: [str] Name of the night.
+        output_dir: [str] Output directory of the monitor.
+        config: [Config] Configuration.
+    """
+
+    _writePlatepar(platepar, os.path.join(night_dir, config.platepar_name))
+
+    latest_night = readReportStates(output_dir)['latest_platepar_night']
+
+    if config.monitor_update_platepar and ((latest_night is None) or (night_name >= latest_night)):
+        _writePlatepar(platepar, latestPlateparPath(output_dir, config))
+        updateReportState(output_dir, latest_platepar_night=night_name)
+        log.info("Best platepar saved for the following data: {:s}".format(
+            latestPlateparPath(output_dir, config)))
+
+
+def plotNightCalibrationVariation(night_dir, night_name, recalibrated, config, ff_frames):
+    """ Plot the variation of the pointing and the photometric offset through the night from the recalibrated
+        platepars, relative to the platepar of the night.
+
+    Arguments:
+        night_dir: [str] Night directory.
+        night_name: [str] Name of the night, used as the prefix of the plot names.
+        recalibrated: [dict] Recalibrated platepars as stored in the JSON file, keyed by the FF name.
+        config: [Config] Configuration.
+        ff_frames: [int] Number of frames per chunk.
+
+    Return:
+        [bool] True if the plots were saved.
+    """
+
+    from RMS.Astrometry.ApplyRecalibrate import plotCalibrationVariation
+
+    platepar = Platepar()
+    platepar.read(os.path.join(night_dir, config.platepar_name))
+
+    recalibrated_platepars = {}
+    for ff_name, pp_dict in recalibrated.items():
+        recalibrated_platepars[ff_name] = Platepar()
+        recalibrated_platepars[ff_name].loadFromDict(pp_dict)
+
+    return plotCalibrationVariation(recalibrated_platepars, platepar, config, night_dir, night_name,
+                                    ff_frames=ff_frames)
+
+
+def removeNightSkyConditions(night_dir, night_name):
+    """ Remove the sky conditions of a night (see plotNightSkyConditions), so an old plot is never mistaken for
+        a new one.
+
+    Arguments:
+        night_dir: [str] Night directory.
+        night_name: [str] Name of the night.
+
+    Return:
+        (csv_path, plot_path): [tuple of str] Paths of the CSV file and of the plot.
+    """
+
+    csv_path = os.path.join(night_dir, night_name + '_sky_conditions.csv')
+    plot_path = os.path.join(night_dir, night_name + '_sky_conditions.png')
+    for path in (csv_path, plot_path):
+        if os.path.isfile(path):
+            os.remove(path)
+
+    return csv_path, plot_path
+
+
+# Names of the summary of the matched filter and of its subdirectory (see RMS.MatchedFilterDetection, which is not
+#   imported here, as importing it initializes CUDA, which can't be used by the processes forked from the monitor)
+MF_DONE_NAME = 'matched_filter_done.json'
+MF_DIR_NAME = 'matched_filter'
+
+
+def readFileSkyResults(results_path, config):
+    """ Read what the processing of one file left about its sky: the stars of its chunks, and the summary of the
+        matched filter (whether it was searched, whether its sky was measured, the detections and the ones
+        removed by clouds).
+
+    Arguments:
+        results_path: [str] Results directory of the file.
+        config: [Config] Configuration.
+
+    Return:
+        file_result: [dict] star_chunks (time and number of stars of every chunk, sorted), chunk_s (length of a
+            chunk, s, None if not known), summary (of the matched filter, None if there is none), searched,
+            measured (the sky quality was measured), removed_times (times of the detections removed by clouds,
+            None for older summaries which only have their number in removed_count), detections, and end_time
+            (the end of the input: its last chunk and the frames after it, from the number of frames of the
+            matched filter, None if not known). None if the results can't be read.
+    """
+
+    # Read the number of stars and the time of every chunk of the file, and the length of a chunk (s)
+    star_list, chunk_s, fps = [], None, None
+    try:
+        for calstars_path in glob.glob(os.path.join(results_path, 'CALSTARS_*.txt')):
+            stars, chunk_frames, calstars_fps = CALSTARS.readCALSTARS(results_path,
+                os.path.basename(calstars_path), return_fps=True)
+            star_list += stars
+            if chunk_frames and calstars_fps:
+                chunk_s, fps = chunk_frames/calstars_fps, calstars_fps
+        star_list = sorted(((filenameToDatetime(entry[0]), len(entry[1]), entry[0]) for entry in star_list),
+                           key=lambda entry: entry[0])
+        last_name = star_list[-1][2] if star_list else None
+        star_list = [(t, n) for t, n, _ in star_list]
+    except Exception as e:
+        log.warning("The stars of {:s} could not be read: {:s}".format(results_path, repr(e)))
+        return None
+
+    file_result = {'star_chunks': star_list, 'chunk_s': chunk_s, 'summary': None, 'searched': False,
+                   'measured': False, 'removed_times': None, 'removed_count': 0, 'detections': 0,
+                   'end_time': None}
+
+    # Without the matched filter only the stars are known (a summary of an earlier run is not used)
+    if not config.mf_enable:
+        return file_result
+
+    # Read the summary of the matched filter of the current mode (it is next to the results when it replaces the
+    #   normal detection, otherwise in its subdirectory). A searched file has the number of its frames
+    summary_path = os.path.join(results_path, MF_DONE_NAME) if config.mf_replace_detection \
+        else os.path.join(results_path, MF_DIR_NAME, MF_DONE_NAME)
+    if not os.path.isfile(summary_path):
+        return file_result
+
+    try:
+        with open(summary_path) as f:
+            summary = json.load(f)
+        file_result['summary'] = summary
+        file_result['searched'] = 'total_frames' in summary
+        file_result['measured'] = file_result['searched'] and (summary.get('clear_sky_fraction') is not None)
+        file_result['detections'] = int(summary.get('detections') or 0)
+
+        # The detections removed by clouds, by their times (older summaries only have their number)
+        removed_times = summary.get('cloud_removed_utc')
+        if isinstance(removed_times, list):
+            file_result['removed_times'] = []
+            for t in removed_times:
+                try:
+                    t = datetime.datetime.strptime(t, '%Y-%m-%dT%H:%M:%S.%f')
+                except (ValueError, TypeError):
+                    t = None
+                file_result['removed_times'].append(t)
+        else:
+            file_result['removed_count'] = int(summary.get('cloud_detections_removed') or 0)
+
+        # The end of the input, as the matched filter read it. Older summaries don't have it: then the last chunk
+        #   (named by its first frame) lasts until the last frame, as the frames after it (fewer than a chunk)
+        #   belong to it. Chunks which are not named by their frames (e.g. without the chunk images) all have 0
+        try:
+            file_result['end_time'] = datetime.datetime.strptime(summary['input_end_utc'], '%Y-%m-%dT%H:%M:%S.%f')
+        except (KeyError, TypeError, ValueError):
+            frame_no = re.findall(r'_(\d{7})(?=[_.])', last_name or '')
+            total_frames = summary.get('total_frames')
+            if fps and frame_no and isinstance(total_frames, int) and (total_frames > int(frame_no[-1])) \
+                    and ((int(frame_no[-1]) > 0) or (len(star_list) == 1)):
+                file_result['end_time'] = star_list[-1][0] \
+                    + datetime.timedelta(seconds=(total_frames - int(frame_no[-1]))/fps)
+
+    except (OSError, ValueError, TypeError, AttributeError) as e:
+        log.warning("The summary {:s} could not be read: {:s}".format(summary_path, repr(e)))
+        return None
+
+    return file_result
+
+
+def medianMagnitude(mags):
+    """ The median of magnitudes, taken on the intensities (magnitudes are logarithmic, so the two middle values
+        of an even number are averaged as intensities).
+
+    Arguments:
+        mags: [list] Magnitudes (None or NaN where not known).
+
+    Return:
+        [float] Median magnitude, None if no magnitude is known.
+    """
+
+    mags = np.array([m for m in mags if (m is not None) and np.isfinite(m)], dtype=np.float64)
+    if not len(mags):
+        return None
+
+    return float(-2.5*np.log10(np.median(10**(-0.4*mags))))
+
+
+def detectionMagnitude(meteor_meas):
+    """ The magnitude of a detection: the median magnitude of its calibrated measurements (the measurements of an
+        uncalibrated detection only have a placeholder magnitude).
+
+    Arguments:
+        meteor_meas: [list] Measurements of the detection, see FTPdetectinfo.readFTPdetectinfo.
+
+    Return:
+        [float] Median magnitude, None if it is not known.
+    """
+
+    return medianMagnitude([m[9] for m in meteor_meas if (len(m) > 9) and (m[0] == 1)])
+
+
+def nightSkyResults(file_results, config, night_start, night_end):
+    """ Combine the sky results of the files of a night (see readFileSkyResults).
+
+    Arguments:
+        file_results: [list] (input_file, file_result) of every file.
+        config: [Config] Configuration.
+        night_start: [datetime] Beginning of the night (UTC).
+        night_end: [datetime] End of the night (UTC).
+
+    Return:
+        (not_searched, removed, measured, chunk_seconds, input_ends):
+            - not_searched: [list] Spans of the files which were not searched as they had too few stars, as
+                (start, end, times of the chunks, stars of the chunks), split where the recording paused.
+            - removed: [int] Number of the detections removed by clouds in the night.
+            - measured: [list] Input files whose sky was measured (their conditions are in the log).
+            - chunk_seconds: [dict] Length of the chunks (s) of the measured files, by their path and name.
+            - input_ends: [dict] End of the measured files (datetime, UTC) where it is known, by their path and
+                name (see SkyQuality.nightTimeline).
+    """
+
+    not_searched = []
+    removed = 0
+    measured = []
+    chunk_seconds = {}
+    input_ends = {}
+    for input_file, file_result in file_results:
+
+        # Count the detections removed by clouds within the night (counted if their time is not known)
+        if file_result['removed_times'] is not None:
+            removed += sum(int((t is None) or (night_start <= t <= night_end))
+                           for t in file_result['removed_times'])
+        else:
+            removed += file_result['removed_count']
+
+        # Keep the files whose sky was measured, by their path as they are named in the log
+        chunk_s = file_result['chunk_s']
+        if file_result['measured'] and input_file:
+            measured.append(input_file)
+            if chunk_s:
+                chunk_seconds[input_file] = chunk_seconds[os.path.basename(input_file)] = chunk_s
+            if file_result.get('end_time') is not None:
+                input_ends[input_file] = input_ends[os.path.basename(input_file)] = file_result['end_time']
+
+        if file_result['searched']:
+            continue
+
+        # A file which was not searched had too few stars in all its chunks (a file with enough stars but without
+        #   a summary failed for another reason, and is not shown)
+        star_list = file_result['star_chunks']
+        if star_list and (max(n for _, n in star_list) < config.ff_min_stars):
+            times = [t for t, _ in star_list]
+            if not chunk_s:
+                chunk_s = (times[-1] - times[0]).total_seconds()/(len(times) - 1) if len(times) > 1 else 0
+            if chunk_s <= 0:
+                chunk_s = 256/max(config.fps, 1)
+
+            # Take its chunks in the night, split into spans where the recording paused
+            chunk = datetime.timedelta(seconds=chunk_s)
+            spans = []
+            for t, n in star_list:
+                if not ((night_start < t + chunk) and (t < night_end)):
+                    continue
+                if spans and (t - spans[-1][0][-1] <= 3*chunk):
+                    spans[-1][0].append(t)
+                    spans[-1][1].append(n)
+                else:
+                    spans.append(([t], [n]))
+            for span_times, span_counts in spans:
+                not_searched.append((span_times[0], span_times[-1] + chunk, span_times, span_counts))
+
+    return not_searched, removed, measured, chunk_seconds, input_ends
+
+
+def nightConditionRows(output_dir, config, measured, chunk_seconds, night_start, night_end, input_ends=None):
+    """ Read the conditions of the chunks of the night of the files whose sky was measured, from the chunk which
+        overlaps the beginning of the night to its end.
+
+    Arguments:
+        output_dir: [str] Output directory of the monitor, where the log of the conditions is.
+        config: [Config] Configuration.
+        measured: [list] Input files whose sky was measured.
+        chunk_seconds: [dict] Length of the chunks (s) of the files, see nightSkyResults.
+        night_start: [datetime] Beginning of the night (UTC).
+        night_end: [datetime] End of the night (UTC).
+
+    Keyword arguments:
+        input_ends: [dict] End of the files (datetime, UTC), see nightSkyResults: the last chunk of a file lasts
+            until it (as in SkyQuality.nightTimeline). None by default.
+
+    Return:
+        rows: [list] Conditions of the chunks, see SkyQuality.readConditions.
+    """
+
+    from RMS.Routines.SkyQuality import readConditions
+
+    # The chunks are read from two chunks before the night, as the last chunk of a file can last almost that long
+    margin = 2*datetime.timedelta(seconds=max(list(chunk_seconds.values()) + [0]))
+    rows = readConditions(output_dir, config.stationID, inputs=set(measured), start=night_start - margin,
+                          end=night_end)
+
+    # Older logs named the files only by their name, read them for the files without rows by their path
+    by_path = set(row['input'] for row in rows)
+    legacy = set(os.path.basename(path) for path in measured if path not in by_path)
+    if legacy:
+        rows = sorted(rows + readConditions(output_dir, config.stationID, inputs=legacy,
+                                            start=night_start - margin, end=night_end),
+                      key=lambda row: (row['time'], row['input']))
+
+    # Drop the chunks which ended before the night. The last chunk of a file lasts until the end of the file, if
+    #   that is after its beginning and less than a chunk after its own end (see SkyQuality.nightTimeline)
+    input_ends = input_ends or {}
+    last_rows = {row['input']: i for i, row in enumerate(rows)}
+
+    def _rowEnd(i, row):
+        step = datetime.timedelta(seconds=chunk_seconds.get(row['input'], 0))
+        end = input_ends.get(row['input'])
+        if (last_rows[row['input']] == i) and (end is not None) and (row['time'] < end <= row['time'] + 2*step):
+            return end
+        return row['time'] + step
+
+    return [row for i, row in enumerate(rows) if _rowEnd(i, row) > night_start]
+
+
+def plotNightSkyConditions(night_dir, night_name, output_dir, results, config, ftpdetectinfo_path):
+    """ Plot how the sky was through the night: the conditions measured from the stars by the matched filter
+        (see SkyQuality.SkyReference), the files which were not searched as they had too few stars, and the
+        times of the detections. The conditions of the night are also saved as a CSV file next to the plot.
+        Results which can't be read are left out, so a damaged file doesn't stop the plot.
+
+    Arguments:
+        night_dir: [str] Night directory.
+        night_name: [str] Name of the night, used as the prefix of the file names.
+        output_dir: [str] Output directory of the monitor, where the log of the conditions is.
+        results: [dict] {results_dir: info} of the night, see scanNights.
+        config: [Config] Configuration.
+        ftpdetectinfo_path: [str] Merged FTPdetectinfo of the detections which are shown.
+
+    Return:
+        [bool] True if the plot was saved, False if there are no conditions for the night.
+    """
+
+    from RMS.Routines.SkyQuality import CONDITION_COLUMNS, plotSkyConditions
+
+    # Remove the products of a previous report first, so a report without conditions doesn't keep them
+    csv_path, plot_path = removeNightSkyConditions(night_dir, night_name)
+
+
+    # Read what the processing left about the sky of every file of the night (files whose results can't be read
+    #   are left out)
+    night_start, night_end = nightBoundsFromName(config, night_name)
+    file_results = []
+    for results_dir in sorted(results):
+        file_result = readFileSkyResults(os.path.join(output_dir, results_dir), config)
+        if file_result is not None:
+            file_results.append((results[results_dir].get('input_file'), file_result))
+
+    # Combine them over the night: the files which were not searched, the detections removed by clouds, and the
+    #   files whose sky was measured, with the time of their chunks
+    not_searched, removed, measured, chunk_seconds, input_ends = nightSkyResults(file_results, config, night_start,
+                                                                                 night_end)
+
+    # Read the conditions of the files whose sky was measured
+    rows = nightConditionRows(output_dir, config, measured, chunk_seconds, night_start, night_end,
+                              input_ends=input_ends)
+
+    if (not rows) and (not not_searched):
+        log.info("No sky conditions for night {:s}".format(night_name))
+        return False
+
+    # Read the time of every detection in the night (the time of its image plus its first frame), and its median
+    #   magnitude (None if it has none, e.g. not calibrated)
+    detection_times, detection_mags = [], []
+    entries = []
+    if os.path.isfile(ftpdetectinfo_path):
+        try:
+            entries = FTPdetectinfo.readFTPdetectinfo(os.path.dirname(ftpdetectinfo_path),
+                                                      os.path.basename(ftpdetectinfo_path))
+        except Exception as e:
+            log.warning("The detections {:s} could not be read: {:s}".format(ftpdetectinfo_path, repr(e)))
+    for entry in entries:
+        ff_name, meteor_fps, meteor_meas = entry[0], entry[4], entry[11]
+        try:
+            t = filenameToDatetime(ff_name) + datetime.timedelta(seconds=meteor_meas[0][1]/meteor_fps)
+        except (ValueError, TypeError, IndexError, ZeroDivisionError):
+            continue
+        if night_start <= t <= night_end:
+            detection_times.append(t)
+            detection_mags.append(detectionMagnitude(meteor_meas))
+
+    # The time of every detection removed by clouds in the night, where it is known
+    removed_times = [t for _, file_result in file_results for t in (file_result['removed_times'] or [])
+                     if (t is not None) and (night_start <= t <= night_end)]
+
+    # Save the conditions of the night as a CSV file, in the format of the log
+    with open(csv_path, 'w') as f:
+        writer = csv.writer(f, lineterminator='\n')
+        writer.writerow(CONDITION_COLUMNS)
+        for row in rows:
+            writer.writerow([row[c] if c in ('chunk_utc', 'input') else '{:g}'.format(row[c])
+                             for c in CONDITION_COLUMNS])
+
+    # Get the date of the night from its name (station_YYYYMMDD_HHMMSS_ffffff) for the title
+    try:
+        night_date = datetime.datetime.strptime(night_name.split('_')[-3], '%Y%m%d').strftime('%Y-%m-%d')
+    except (ValueError, IndexError):
+        night_date = night_name
+
+    # Plot the night
+    summary = plotSkyConditions(rows, plot_path, '{:s} sky conditions, night of {:s}'.format(config.stationID,
+        night_date), not_searched=not_searched, detection_times=detection_times, removed_detections=removed,
+        cloud_max_offset=(config.mf_cloud_max_offset if config.mf_cloud_filter else None),
+        min_matched=config.mf_cloud_min_matched, chunk_seconds=chunk_seconds, bounds=(night_start, night_end),
+        input_ends=input_ends, removed_times=removed_times, detection_mags=detection_mags)
+
+    log.info("Sky conditions of night {:s}: {:.1f} h observed, clear {:.0f}%, partly clouded {:.0f}%, clouded "
+             "{:.0f}%, {:d} file(s) not searched".format(night_name, summary['observed_h'],
+                100*summary['clear'], 100*summary['partly'], 100*summary['clouded'], len(not_searched)))
+
+    return True
+
+
+def writeObservationSummary(night_dir, night_name, config, frames_per_file, n_detections, photometry_good):
+    """ Write the observation summary of the night (observation_summary.txt and .json), as at the end of a
+        normal RMS night. The parameters which RMS records at the start of the capture are filled in from the
+        data, as there is no live capture (e.g. the camera is not queried).
+
+    Arguments:
+        night_dir: [str] Night directory.
+        night_name: [str] Name of the night.
+        config: [Config] Configuration, with data_dir set to the output directory of the monitor.
+        frames_per_file: [int] Number of frames per FF-equivalent image pair.
+        n_detections: [int] Number of detections in the night.
+        photometry_good: [bool] True if a platepar was recalibrated successfully during the night.
+
+    Return:
+        [tuple] Paths of the text and the JSON summary.
+    """
+
+    from RMS.Formats import ObservationSummary as obs
+
+    # The observation spans from the first to the end of the last image of the night, or the whole night if
+    #   no images were saved
+    ff_names = sorted(file_name for file_name in os.listdir(night_dir) if FFpng.isPairMaxName(file_name))
+    if ff_names:
+        obs_start = filenameToDatetime(ff_names[0])
+        obs_end = filenameToDatetime(ff_names[-1]) + datetime.timedelta(seconds=frames_per_file/config.fps)
+    else:
+        obs_start, obs_end = nightBoundsFromName(config, night_name)
+
+    # Start a new summary of the night (the working summary of a previous report of the night is removed). The
+    #   database keeps a row for every night, from which e.g. the days since the last detection are computed
+    working_path = getRMSStyleFileName(night_dir, obs.OBSERVATION_SUMMARY_WORKING_NAME_JSON)
+    if os.path.exists(working_path):
+        os.remove(working_path)
+
+    # The parameters are collected in the summary of the night, which the end of the observation stores
+    summary = obs.getObservationSummaryDict(night_dir)
+    obs.addObsParam(summary, "start_time", obs_start.replace(tzinfo=datetime.timezone.utc))
+    obs.addObsParam(summary, "duration_from_start_of_observation", round((obs_end - obs_start).total_seconds()))
+    obs.addObsParam(summary, "stationID", config.stationID)
+    obs.addObsParam(summary, "hardware_version", platform.machine())
+    obs.addObsParam(summary, "camera_information", "Processed from recorded data")
+    obs.addObsParam(summary, "detections_after_ml", n_detections)
+    obs.addObsParam(summary, "photometry_good", str(photometry_good))
+
+    return obs.finalizeObservationSummary(config, night_dir, frames_per_file=frames_per_file)
+
+
+def scaledThumbStack(thumb_stack, chunk_frames, ff_frames=256):
+    """ Scale the number of images stacked in one thumbnail from FF files to frame chunks of a different
+        length, so a thumbnail covers the same number of frames.
+
+    Arguments:
+        thumb_stack: [int] Number of FF files stacked in one thumbnail (config.thumb_stack).
+        chunk_frames: [int] Number of frames per chunk, None if unknown.
+
+    Keyword arguments:
+        ff_frames: [int] Number of frames in an FF file. 256 by default.
+
+    Return:
+        [int] Number of chunks stacked in one thumbnail, at least 1.
+    """
+
+    if not chunk_frames:
+        return thumb_stack
+
+    return max(1, int(round(thumb_stack*ff_frames/chunk_frames)))
+
+
+def generateNightReport(output_dir, night_name, config, results=None, archive=True):
+    """ Merge the results of a night and generate its report.
+
+    Arguments:
+        output_dir: [str] Output directory of the monitor.
+        night_name: [str] Name of the night.
+        config: [Config] Configuration of the camera.
+
+    Keyword arguments:
+        results: [dict] {results_dir: info} of the night, see scanNights. Found in the output directory if not
+            given.
+        archive: [bool] Archive the night into ArchivedFiles, like a normal RMS night. True by default. If
+            False, only the thumbnails and the stacks are generated.
+
+    Return:
+        [dict] Report state of the night: files (only updated if all essential steps succeeded), reported_at,
+            ok_steps, failed_steps, upload_files.
+    """
+
+    # The report tools are imported here, as they are not needed for the processing
+    from RMS.ArchiveDetections import archiveDetections, generateThumbsAndStacks
+    from Utils.CalibrationReport import generateCalibrationReport
+    from Utils.GenerateTimelapse import generateTimelapse
+
+    # Results finished after this time are reported again, see unreportedResults
+    files_time = RmsDateTime.utcnow()
+
+    # With the automatic calibration, the files of the night which were processed before the platepar was fitted
+    #   get the astrometry and the photometry now (if no worker did it yet). Their done flags change, so the results
+    #   are scanned again
+    if config.monitor_auto_calibration:
+        from RMS.MonitorProcessFrameInterface import backfillCalibration
+        try:
+            if backfillCalibration(output_dir, config, night_name):
+                results = None
+
+        except Exception:
+
+            # A failure doesn't stop the report, the files are reported without the calibration
+            log.error("Adding the calibration to the files of night {:s} failed:\n{:s}".format(night_name,
+                                                                                              traceback.format_exc()))
+
+    if results is None:
+        results = scanNights(output_dir, config).get(night_name, {})
+
+    night_dir = nightDirPath(output_dir, night_name, config)
+    os.makedirs(night_dir, exist_ok=True)
+
+    log.info("Generating the report for night {:s} from {:d} file(s)...".format(night_name, len(results)))
+
+    ok_steps = []
+    failed_steps = []
+
+    def _runStep(step_name, func):
+        """ Run a report step, logging its errors. Return its result, None if it failed. """
+
+        log.info("Night report step: {:s}".format(step_name))
+        try:
+            result = func()
+            ok_steps.append(step_name)
+            return result
+
+        except Exception as e:
+            log.error("Night report step {:s} failed: {:s}".format(step_name, repr(e)))
+            log.error("".join(traceback.format_exception(*sys.exc_info())))
+            failed_steps.append(step_name)
+            return None
+
+
+    merged = _runStep('merge', lambda: mergeNightResults(night_dir, output_dir, results, config))
+
+    # Remove the sky conditions of a previous report, they are plotted again below if they can be
+    removeNightSkyConditions(night_dir, night_name)
+
+    # The detections of the matched filter are merged into their own file in a subdirectory of the night, so
+    #   they are kept apart from the normal detections in the rest of the report
+    if config.mf_enable:
+
+        # Imported only when used, not at the top of the module: importing the kernels of the matched filter
+        #   checks for a CUDA GPU, which initializes CUDA, and the monitor which imports this module forks its
+        #   workers after it (a CUDA context can't be used in forked processes)
+        from RMS.MatchedFilterDetection import mergeNightMatchedFilter
+        _runStep('matched_filter_merge', lambda: mergeNightMatchedFilter(night_dir,
+            [os.path.join(output_dir, results_dir) for results_dir in sorted(results)], config))
+
+    upload_files = []
+    recalibration = None
+    if merged is not None:
+
+        ### Configuration of the night ###
+        config = copy.deepcopy(config)
+
+        # Keep the logs, archives and observation database inside the output directory, and use the mask and
+        #   the platepar copied to the night directory
+        config.data_dir = output_dir
+        config.log_dir = 'logs'
+        config.config_file_path = night_dir
+
+        # The chunk times are computed from the frame rate of the data
+        if merged.fps:
+            config.fps = merged.fps
+
+        # Use the same dark and flat settings as the processing, so e.g. the photometry doesn't correct the
+        #   vignetting of flat fielded images again
+        config.use_dark = any(info.get('dark_applied', False) for info in results.values())
+        config.use_flat = any(info.get('flat_applied', False) for info in results.values())
+
+        # The thumbnail stacking is set up for FF files with 256 frames. Scale it to the chunk length, so
+        #   every thumbnail covers the same number of frames as with normal FF files
+        config.thumb_stack = scaledThumbStack(config.thumb_stack, merged.chunk_frames)
+
+        chunk_frames = merged.chunk_frames if merged.chunk_frames else 256
+        ftpdetectinfo_path = os.path.join(night_dir, merged.ftpdetectinfo_name)
+
+        ### ###
+
+
+        # The share of the chunks which could be recalibrated. A low share means that the platepar doesn't fit
+        #   the data (e.g. the platepar of another camera, or the camera moved), which no step fails on
+        n_recalibrated = sum(1 for pp_dict in merged.recalibrated.values()
+                             if (pp_dict is not None) and pp_dict.get('auto_recalibrated'))
+        recalibration = {'recalibrated': n_recalibrated, 'chunks': len(merged.recalibrated)}
+        if merged.recalibrated and (n_recalibrated < RECALIBRATION_WARNING_SHARE*len(merged.recalibrated)):
+            log.warning("Only {:d} of {:d} chunks of night {:s} could be recalibrated. Check the platepar "
+                        "and the pointing of the camera.".format(n_recalibrated, len(merged.recalibrated),
+                                                             night_name))
+
+        # Save the most confident platepar of the night and carry it forward to the following data. With the
+        #   automatic calibration, it is taken only from the files calibrated with the newest platepar of the night,
+        #   so a platepar which was replaced during the night (e.g. it fits the stars only in a part of the image,
+        #   where its recalibration still succeeds) is not carried forward again
+        best_platepar = None
+        candidates = merged.recalibrated
+        if config.monitor_auto_calibration:
+            candidates = newestPlateparRecalibrations(output_dir, results, merged.recalibrated, config)
+        if candidates:
+            best_platepar = _runStep('platepar_selection',
+                lambda: selectBestNightPlatepar(candidates, use_flat=config.use_flat))
+
+        if best_platepar is not None:
+            ff_name, platepar, n_stars, residual = best_platepar
+            log.info("Best platepar of the night: {:s}, {:d} stars, median residual {:.3f} px".format(ff_name,
+                n_stars, residual))
+            saveNightPlatepar(platepar, night_dir, night_name, output_dir, config)
+
+        # The calibration report and plots need the platepar of the night (there is none if no file of the night
+        #   was calibrated)
+        night_platepar_exists = os.path.isfile(os.path.join(night_dir, config.platepar_name))
+
+        if (merged.calstars_name is not None) and night_platepar_exists:
+            _runStep('calibration_report',
+                lambda: generateCalibrationReport(config, night_dir, min_size=1000))
+
+        if merged.recalibrated and night_platepar_exists:
+            _runStep('calibration_variation', lambda: plotNightCalibrationVariation(night_dir, night_name,
+                merged.recalibrated, config, chunk_frames))
+
+        # Plot the sky conditions through the night, with the detections of the matched filter (the merged ones
+        #   when it replaces the normal detection, otherwise those in its subdirectory)
+        if config.mf_enable:
+            mf_ftpdetectinfo_path = ftpdetectinfo_path
+            if not config.mf_replace_detection:
+                from RMS.MatchedFilterDetection import MATCHED_FILTER_DIR
+                mf_ftpdetectinfo_path = (sorted(glob.glob(os.path.join(night_dir, MATCHED_FILTER_DIR,
+                                                                       'FTPdetectinfo_*.txt'))) + [''])[0]
+            _runStep('sky_conditions', lambda: plotNightSkyConditions(night_dir, night_name, output_dir,
+                results, config, mf_ftpdetectinfo_path))
+
+
+        ### Optional products (off by default) ###
+
+        # The platepar of the night, None if no file of the night was calibrated
+        platepar = None
+        if os.path.isfile(os.path.join(night_dir, config.platepar_name)):
+            platepar = Platepar()
+            platepar.read(os.path.join(night_dir, config.platepar_name), use_flat=config.use_flat)
+
+        mask = None
+        if os.path.isfile(os.path.join(night_dir, config.mask_file)):
+            mask = loadMask(os.path.join(night_dir, config.mask_file))
+
+        # Without a platepar of the night, the products which need it are skipped
+        if (platepar is None) and (config.monitor_shower_association or config.monitor_fov_kml
+                                   or config.monitor_flux):
+            log.info("Night {:s} has no platepar, the products which need it are skipped".format(night_name))
+
+        if config.monitor_shower_association and (platepar is not None):
+            from Utils.ShowerAssociation import showerAssociation
+            _runStep('shower_association', lambda: showerAssociation(config, [ftpdetectinfo_path],
+                save_plot=True, plot_activity=True, color_map=config.shower_color_map,
+                sporadic_color=config.sporadic_color))
+
+        if config.monitor_fov_kml and (platepar is not None):
+            from Utils.FOVKML import fovKML
+            _runStep('fov_kml', lambda: [fovKML(night_dir, platepar, mask=mask, plot_station=False,
+                area_ht=area_ht) for area_ht in [100000, 70000, 25000]])
+
+        if config.monitor_flux and (platepar is not None):
+            from Utils.Flux import prepareFluxFiles
+            _runStep('flux', lambda: prepareFluxFiles(config, night_dir, ftpdetectinfo_path, mask=mask,
+                                                      platepar=platepar))
+
+        if config.monitor_observation_summary:
+            _runStep('observation_summary', lambda: writeObservationSummary(night_dir, night_name, config,
+                chunk_frames, merged.n_meteors, best_platepar is not None))
+
+        ### ###
+
+
+        # Generate the timelapse before archiving, so it is archived
+        timelapse_name = night_name + "_timelapse.mp4"
+        if config.timelapse_generate_captured:
+            _runStep('timelapse', lambda: generateTimelapse(night_dir, output_file=timelapse_name))
+
+        # Remove the detection stacks of a previous report, their names contain the number of meteors
+        for stack_path in glob.glob(os.path.join(night_dir, night_name + '_stack_*_meteors.*')):
+            os.remove(stack_path)
+
+        if archive:
+
+            # Archive the night from scratch, so no files of a previous report remain in the archive
+            archived_dir = os.path.join(output_dir, config.archived_dir, night_name)
+            shutil.rmtree(archived_dir, ignore_errors=True)
+
+            # Add the files which are not selected from the night directory, as processNight does
+            extra_files = [os.path.join(night_dir, file_name) for file_name in os.listdir(night_dir)
+                           if file_name.endswith(('.config', '.kml', '.mp4', '.json', '.ecsv', '.cal'))
+                           or (file_name == config.mask_file)]
+
+            ecsv_dir = os.path.join(night_dir, ECSV_DIR_NAME)
+            if os.path.isdir(ecsv_dir):
+                extra_files += sorted(glob.glob(os.path.join(ecsv_dir, '*.ecsv')))
+
+            # Archiving also generates the thumbnails and the stacks. A meteor longer than a chunk is on
+            #   several images, so the stack is named with the number of meteors, not of images
+            archives = _runStep('archive', lambda: archiveDetections(night_dir, archived_dir,
+                merged.ff_detected, config, extra_files=extra_files, n_meteors=merged.n_meteors))
+
+            if archives is not None:
+                upload_files = [os.path.abspath(path) for path in archives if path is not None]
+
+        else:
+            _runStep('thumbnails_and_stacks', lambda: generateThumbsAndStacks(night_dir, config,
+                merged.ff_detected, n_meteors=merged.n_meteors))
+
+
+    # Mark the files as reported only if all essential steps succeeded, otherwise the report is retried
+    night_state = {
+        'reported_at': RmsDateTime.utcnow().strftime(JSON_TIME_FORMAT),
+        'recalibration': recalibration,
+        'ok_steps': ok_steps,
+        'failed_steps': failed_steps,
+        'upload_files': upload_files,
+    }
+
+    # A report without the archive (e.g. a test from the command line) doesn't count as reported, so the
+    #   monitor still archives the night
+    if archive and not (ESSENTIAL_STEPS & set(failed_steps)):
+        night_state['files'] = sorted(results)
+        night_state['files_time'] = files_time.strftime(JSON_TIME_FORMAT)
+        night_state['succeeded_at'] = night_state['reported_at']
+
+    updateReportState(output_dir, night_name, **night_state)
+
+    log.info("Night report for {:s} done, failed steps: {:s}".format(night_name,
+        ", ".join(failed_steps) if failed_steps else "none"))
+
+    return readReportStates(output_dir)['nights'][night_name]
+
+
+
+### Cleanup ###
+
+def deleteOldNightImages(output_dir, config, states, nights, now=None):
+    """ Delete the image pairs of nights which were reported more than monitor_delete_images_days ago and have
+        no unreported files. The reports and the archives are kept.
+
+    Arguments:
+        output_dir: [str] Output directory of the monitor.
+        config: [Config] Configuration.
+        states: [dict] Report states, see readReportStates.
+        nights: [dict] Results of all nights, see scanNights.
+
+    Keyword arguments:
+        now: [datetime] Current time, the current UTC time by default.
+
+    Return:
+        [list] Names of the nights whose images were deleted.
+    """
+
+    if config.monitor_delete_images_days <= 0:
+        return []
+
+    if now is None:
+        now = RmsDateTime.utcnow()
+
+    cleaned = []
+    for night_name, night_state in sorted(states['nights'].items()):
+
+        night_dir = nightDirPath(output_dir, night_name, config)
+        if (not os.path.isdir(night_dir)) or ('files' not in night_state) \
+                or unreportedResults(output_dir, states, night_name, nights.get(night_name, {})):
+            continue
+
+        reported_at = datetime.datetime.strptime(night_state['reported_at'], JSON_TIME_FORMAT)
+        if (now - reported_at).total_seconds() < config.monitor_delete_images_days*86400:
+            continue
+
+        pair_files = [file_name for file_name in os.listdir(night_dir) if FFpng.isPairName(file_name)]
+        for file_name in pair_files:
+            os.remove(os.path.join(night_dir, file_name))
+
+        if pair_files:
+            log.info("Deleted {:d} image files of night {:s}".format(len(pair_files), night_name))
+            cleaned.append(night_name)
+
+            # The night is not reported again, as a report without the images would replace its products
+            #   and archive with nearly empty ones
+            updateReportState(output_dir, night_name, images_deleted=True)
+
+    return cleaned
+
+
+def directorySize(dir_path):
+    """ Total size of the files in a directory tree, in bytes. """
+
+    return sum(os.path.getsize(os.path.join(root, file_name))
+               for root, _, files in os.walk(dir_path) for file_name in files)
+
+
+def pruneResults(output_dir, config, nights):
+    """ Delete the results and the report states of the nights whose directory was deleted, except the done
+        flags, which mark the input files as processed. Such nights are not reported again (see
+        NightReporter), so their results (CALSTARS, FTPdetectinfo, recalibrated platepars, config copies)
+        and report states are not needed anymore.
+
+    Arguments:
+        output_dir: [str] Output directory of the monitor.
+        config: [Config] Configuration.
+        nights: [dict] {night_name: {results_dir: info}}, see scanNights.
+
+    Return:
+        [int] Number of pruned results directories.
+    """
+
+    n_pruned = 0
+    for night_name, results in nights.items():
+
+        if os.path.isdir(nightDirPath(output_dir, night_name, config)):
+            continue
+
+        for results_dir in results:
+            results_path = os.path.join(output_dir, results_dir)
+
+            file_names = [file_name for file_name in os.listdir(results_path) if file_name != DONE_FLAG_NAME]
+            for file_name in file_names:
+                path = os.path.join(results_path, file_name)
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
+
+            n_pruned += bool(file_names)
+
+    if n_pruned:
+        log.info("Deleted the results of {:d} processed files of deleted nights, keeping their done "
+                 "flags".format(n_pruned))
+
+    # Reduce the report states of the deleted nights to a mark, so the state file doesn't grow. The mark keeps
+    #   them from being reported again if their directory is created again (e.g. by a late file of the night)
+    with reportStateLock(output_dir):
+
+        states = readReportStates(output_dir)
+        deleted = [night_name for night_name, night_state in states['nights'].items()
+                   if (not night_state.get('deleted'))
+                   and (not os.path.isdir(nightDirPath(output_dir, night_name, config)))]
+        if deleted:
+            for night_name in deleted:
+                states['nights'][night_name] = {'deleted': True}
+
+            _writeJSON(os.path.join(output_dir, REPORT_STATE_FILE_NAME), states)
+
+    return n_pruned
+
+
+def inputFileBases(input_dir, input_ext, recursive=False):
+    """ Find the names (without the extension) of the input files with the given extension, which name the
+        results directories of older monitor versions.
+
+    Arguments:
+        input_dir: [str] Input directory of the monitor.
+        input_ext: [str] Extension of the input files (e.g. '.vid'). Compared case-insensitively, like the
+            monitor does when it picks the input files.
+
+    Keyword arguments:
+        recursive: [bool] Also find the files in the subdirectories. False by default.
+
+    Return:
+        [set] File names without the extension, None if the input directory can't be read.
+    """
+
+    def _raise(error):
+        raise error
+
+    input_ext = input_ext.lower()
+
+    try:
+        if recursive:
+            walker = os.walk(input_dir, onerror=_raise)
+        else:
+            walker = [(input_dir, [], os.listdir(input_dir))]
+
+        return {os.path.splitext(file_name)[0] for _, _, files in walker for file_name in files
+                if file_name.lower().endswith(input_ext)}
+
+    except OSError:
+        return None
+
+
+def deleteDoneFlags(output_dir, config, input_dir=None, input_ext=None, recursive=False):
+    """ Delete the results directories (with their done flags) of input files which were deleted, once their
+        night was deleted or the file was skipped by the night cutoff. The done flag only keeps a file from
+        being processed again, which is not needed anymore when the file is gone. Files whose input directory
+        can't be found (e.g. an unmounted disk) are kept.
+
+    Done flags of older versions don't name their input file. They are empty and have no night, so their
+    results are not in any night report. If the input directory and the extension of the files are given,
+    the input file is named like the results directory (plus the extension, in any case) in the input
+    directory (or its subdirectories if recursive), and the results are deleted once that file is gone.
+
+    Arguments:
+        output_dir: [str] Output directory of the monitor.
+        config: [Config] Configuration.
+
+    Keyword arguments:
+        input_dir: [str] Input directory of the monitor, for the done flags of older versions. None by
+            default, in which case they are kept.
+        input_ext: [str] Extension of the input files (e.g. '.vid'), for the done flags of older versions.
+            None by default, in which case they are kept.
+        recursive: [bool] The monitor also processes the files in the subdirectories of the input directory
+            (--recursive). False by default.
+
+    Return:
+        [int] Number of deleted results directories.
+    """
+
+    # Names of the input files, for the done flags of older versions (found when first needed)
+    input_bases = None
+    input_bases_found = False
+
+    n_deleted = 0
+    for root, dirs, files in os.walk(output_dir):
+
+        # Don't descend into the night, archive and log directories
+        if root == output_dir:
+            dirs[:] = [d for d in dirs if d not in (config.captured_dir, config.archived_dir, 'logs')]
+
+        # Don't descend into the output directory of another monitor
+        if (root != output_dir) and (MONITOR_LOCK_FILE_NAME in files):
+            dirs[:] = []
+            continue
+
+        if DONE_FLAG_NAME not in files:
+            continue
+
+        # Results directories don't contain other results
+        dirs[:] = []
+
+        info = readDoneFlag(root)
+        input_file = info.get('input_file')
+
+        # The done flags of older versions are kept if their input file can't be found by its name
+        if (input_file is None) and ((input_dir is None) or (input_ext is None)):
+            continue
+
+        # The results of a night are needed for its report until the night is deleted
+        if ('night' in info) and (not info.get('skipped')) \
+                and os.path.isdir(nightDirPath(output_dir, info['night'], config)):
+            continue
+
+        # The input file of a done flag of an older version is named like its results directory. Its results
+        #   are kept if the input directory can't be read
+        if input_file is None:
+            if not input_bases_found:
+                input_bases = inputFileBases(input_dir, input_ext, recursive=recursive)
+                input_bases_found = True
+
+            if (input_bases is None) or (os.path.basename(root) in input_bases):
+                continue
+
+        elif os.path.exists(input_file) or (not os.path.isdir(os.path.dirname(input_file))):
+            continue
+
+        shutil.rmtree(root, ignore_errors=True)
+        n_deleted += 1
+
+        # Delete the date directories which are now empty
+        parent = os.path.dirname(root)
+        while (parent != output_dir) and os.path.isdir(parent) and (not os.listdir(parent)):
+            os.rmdir(parent)
+            parent = os.path.dirname(parent)
+
+    if n_deleted:
+        log.info("Deleted the done flags of {:d} input files which were deleted".format(n_deleted))
+
+    return n_deleted
+
+
+def freeSpace(output_dir, config, needed_bytes, protected_nights=()):
+    """ Delete the oldest nights (the night directory and its archives) until the output directory has the
+        given free space. The latest night is never deleted. If deleting the old nights can't free enough
+        space, because other data takes the disk (e.g. the recordings on a shared disk), nothing is deleted.
+
+    Arguments:
+        output_dir: [str] Output directory of the monitor.
+        config: [Config] Configuration.
+        needed_bytes: [float] Free space needed, in bytes.
+
+    Keyword arguments:
+        protected_nights: [list] Nights which are not deleted, e.g. the night being reported. Empty by
+            default.
+
+    Return:
+        [bool] True if there is enough free space.
+    """
+
+    if availableSpace(output_dir) >= needed_bytes:
+        return True
+
+    captured_path = os.path.join(output_dir, config.captured_dir)
+    archived_path = os.path.join(output_dir, config.archived_dir)
+
+    night_names = sorted(set(getNightDirs(captured_path, config.stationID))
+                         | set(getNightDirs(archived_path, config.stationID)))
+
+    # The data of the nights which can be deleted: the night directory, the archive directory and archives
+    archived_files = os.listdir(archived_path) if os.path.isdir(archived_path) else []
+    night_paths = collections.OrderedDict()
+    for night_name in night_names[:-1]:
+        if night_name not in protected_nights:
+            night_paths[night_name] = [os.path.join(captured_path, night_name)] \
+                + [os.path.join(archived_path, file_name) for file_name in archived_files
+                   if file_name.startswith(night_name)]
+
+    def _size(path):
+        return directorySize(path) if os.path.isdir(path) else os.path.getsize(path)
+
+    deletable_bytes = sum(_size(path) for paths in night_paths.values() for path in paths
+                          if os.path.exists(path))
+
+    if availableSpace(output_dir) + deletable_bytes < needed_bytes:
+        log.warning("{:.1f} GB are needed in {:s} for the next night, but only {:.1f} GB are free and the "
+                    "old nights of the monitor take {:.1f} GB, so the rest of the disk is used by other "
+                    "data. No nights are deleted.".format(needed_bytes/1024**3, output_dir,
+                                                 availableSpace(output_dir)/1024**3, deletable_bytes/1024**3))
+        return False
+
+    for night_name, paths in night_paths.items():
+
+        if availableSpace(output_dir) >= needed_bytes:
+            return True
+
+        log.info("Deleting night {:s} to free space for the next night".format(night_name))
+        for path in paths:
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            elif os.path.exists(path):
+                os.remove(path)
+
+    return availableSpace(output_dir) >= needed_bytes
+
+
+def cleanupOldData(output_dir, config, protected_nights=(), input_dir=None, input_ext=None, recursive=False):
+    """ Delete old data from the output directory with the data management of normal RMS
+        (DeleteOldObservations): old night directories in CapturedFiles and ArchivedFiles (by the number of
+        directories to keep, the quotas, and the free space needed for the next night), old archives and log
+        files. Night directories with unreported files are kept unless the space is needed. The image pairs of
+        reported nights are deleted after monitor_delete_images_days.
+
+    Arguments:
+        output_dir: [str] Output directory of the monitor.
+        config: [Config] Configuration of the camera.
+
+    Keyword arguments:
+        protected_nights: [list] Nights which are not deleted, e.g. the night being reported. Empty by
+            default.
+        input_dir: [str] Input directory of the monitor, see deleteDoneFlags. None by default.
+        input_ext: [str] Extension of the input files, see deleteDoneFlags. None by default.
+        recursive: [bool] The input files are also in subdirectories, see deleteDoneFlags. False by default.
+
+    Return:
+        [bool] True if there's enough free space for the next night.
+    """
+
+    states = readReportStates(output_dir)
+    nights = scanNights(output_dir, config)
+
+    deleteOldNightImages(output_dir, config, states, nights)
+
+    if not config.monitor_delete_old_data:
+        return True
+
+    # Manage the output directory like the RMS data directory
+    config = copy.deepcopy(config)
+    config.data_dir = output_dir
+    config.log_dir = 'logs'
+
+    # Keep the night directories back to the oldest night with unreported files or protected night
+    pending = [night_name for night_name, results in nights.items()
+               if isPending(output_dir, config, states, night_name, results)] + list(protected_nights)
+
+    captured_path = os.path.join(output_dir, config.captured_dir)
+    night_dirs = getNightDirs(captured_path, config.stationID)
+
+    if pending and (config.capt_dirs_to_keep > 0):
+        config.capt_dirs_to_keep = max(config.capt_dirs_to_keep,
+                                       len([d for d in night_dirs if d >= min(pending)]))
+
+    # Delete by the numbers of directories to keep and the quotas. The space is freed below, as the RMS
+    #   estimate of the space needed for the next night comes from the capture settings, which don't describe
+    #   the data of the monitor, and its deletion loop can delete the latest night. It runs while the free
+    #   space is not larger than the needed space, so -1 disables it also on a completely full disk
+    deleteOldObservations(output_dir, config.captured_dir, config.archived_dir, config, needed_bytes=-1)
+
+    # The space needed for the next night is the size of the largest of the last nights
+    night_dirs = getNightDirs(captured_path, config.stationID)
+    needed_bytes = config.extra_space_gb*1024**3
+    if night_dirs:
+        needed_bytes += max(directorySize(os.path.join(captured_path, night_dir))
+                            for night_dir in night_dirs[-3:])
+
+    enough_space = freeSpace(output_dir, config, needed_bytes, protected_nights=protected_nights)
+
+    pruneResults(output_dir, config, nights)
+    deleteDoneFlags(output_dir, config, input_dir=input_dir, input_ext=input_ext, recursive=recursive)
+
+    # Delete the old logs of the monitor processes, which have a prefix
+    deleteOldLogfiles(output_dir, config, pattern='*log_*.log*')
+
+    if not enough_space:
+        log.warning("Not enough free space in {:s} for the next night!".format(output_dir))
+
+    return enough_space
+
+
+
+### Worker processes ###
+
+def stopProcess(proc, name, timeout=10):
+    """ Stop a process with SIGTERM, and with SIGKILL if it doesn't end. The waits are bounded, so a process
+        stuck in an uninterruptible call (e.g. on a hung file system) can't block the caller.
+
+    Arguments:
+        proc: [multiprocessing.Process] The process.
+        name: [str] Name of the process for the log.
+
+    Keyword arguments:
+        timeout: [float] Seconds to wait after each signal. 10 by default.
+
+    Return:
+        [bool] True if the process ended.
+    """
+
+    proc.terminate()
+    proc.join(timeout)
+
+    if proc.is_alive():
+        proc.kill()
+        proc.join(timeout)
+
+    if proc.is_alive():
+        log.error("{:s} (PID {}) could not be stopped, it is left behind".format(name, proc.pid))
+        return False
+
+    return True
+
+
+def exitWithMonitor(interval=2.0):
+    """ End this worker process when the monitor process which started it is gone, e.g. when it was killed,
+        so the worker doesn't keep running next to a restarted monitor. Call it at the start of the worker.
+
+    Keyword arguments:
+        interval: [float] Seconds between the checks. 2 by default.
+    """
+
+    # Nothing to watch outside of a worker process (e.g. a report from the command line)
+    parent = multiprocessing.parent_process()
+    if parent is None:
+        return
+
+    monitor_pid = parent.pid
+
+    # With the fork start method the worker is orphaned when the monitor dies, with other start methods (e.g.
+    #   forkserver) the monitor process doesn't exist anymore
+    ppid = os.getppid()
+
+    def _watch():
+        while True:
+            time.sleep(interval)
+            try:
+                os.kill(monitor_pid, 0)
+                if os.getppid() == ppid:
+                    continue
+            except OSError:
+                pass
+
+            os._exit(1)
+
+    threading.Thread(target=_watch, daemon=True).start()
+
+
+def _initWorkerLogging(config, output_dir, prefix):
+    """ Log into the logs directory of the output directory, let SIGTERM end the worker right away (the
+        monitor stops its workers with SIGTERM), and end it if the monitor is gone.
+    """
+
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    exitWithMonitor()
+
+    config.data_dir = output_dir
+    config.log_dir = 'logs'
+    LoggingManager().initLogging(config, prefix)
+
+
+def nightReportWorker(output_dir, night_name, config_path, results):
+    """ Worker process target which generates a night report. Exits with 1 if an essential step failed. """
+
+    config = cr.parse(config_path)
+    _initWorkerLogging(config, output_dir, 'report_{:s}_'.format(night_name))
+
+    try:
+        night_state = generateNightReport(output_dir, night_name, config, results=results)
+
+    except Exception:
+        log.error("".join(traceback.format_exception(*sys.exc_info())))
+        sys.exit(1)
+
+    sys.exit(1 if (ESSENTIAL_STEPS & set(night_state['failed_steps'])) else 0)
+
+
+def cleanupWorker(output_dir, config_path, protected_nights=(), input_dir=None, input_ext=None,
+                  recursive=False):
+    """ Worker process target which deletes old data, except the given nights (e.g. the night being
+        reported).
+    """
+
+    config = cr.parse(config_path)
+    _initWorkerLogging(config, output_dir, 'cleanup_')
+
+    cleanupOldData(output_dir, config, protected_nights=protected_nights, input_dir=input_dir,
+                   input_ext=input_ext, recursive=recursive)
+
+
+
+### Scheduling ###
+
+class ReportLock(object):
+    """ Lets only one of several night reporters (e.g. the cameras of the multi-camera monitor) run a report
+        at a time, so the reports don't compete with the processing for the CPU.
+    """
+
+    def __init__(self):
+        self.owner = None
+
+
+class NightReporter(object):
+    """ Schedules the night reports and the cleanup of old data of one camera from the monitor loop. Reports
+        and cleanups run in separate processes, one at a time.
+
+    Arguments:
+        output_dir: [str] Output directory of the monitor.
+        config_path: [str] Path to the config file of the camera.
+
+    Keyword arguments:
+        report_mode: [str] One of ConfigReader.MONITOR_REPORT_MODES. The config value is used if None.
+        fail_wait_time: [float] Seconds to wait before retrying a failed report. 300 by default.
+        camera_id: [str] Camera ID used in the log messages. None by default.
+        report_lock: [ReportLock] Lock shared with the reporters of other cameras. None by default.
+        input_dir: [str] Input directory of the camera, for the cleanup of the done flags of older versions.
+            None by default.
+        input_ext: [str] Extension of the input files (e.g. '.vid'), see input_dir. None by default.
+        recursive: [bool] The input files are also in the subdirectories of input_dir. False by default.
+    """
+
+    def __init__(self, output_dir, config_path, report_mode=None, fail_wait_time=300, camera_id=None,
+                 report_lock=None, input_dir=None, input_ext=None, recursive=False):
+
+        self.output_dir = output_dir
+        self.config_path = config_path
+
+        # The input directory and the extension of the input files, for the cleanup of the done flags of older
+        #   versions (see deleteDoneFlags)
+        self.input_dir = input_dir
+        self.input_ext = input_ext
+        self.recursive = recursive
+        self.config = cr.parse(config_path)
+        self.fail_wait_time = fail_wait_time
+        self.report_lock = report_lock if report_lock is not None else ReportLock()
+
+        self.log_prefix = "[{:s}] ".format(camera_id) if camera_id else ""
+
+        self.report_mode = report_mode if report_mode is not None else self.config.monitor_report_mode
+        self.quiet_s = 60*self.config.monitor_report_quiet_min
+
+        # Running report: (process, night_name, results)
+        self.active = None
+
+        # Failed reports: {night_name: {'count': int, 'time': datetime, 'n_files': int}}
+        self.failed = {}
+
+        # Nights requested by the trigger file
+        self.triggered = set()
+
+        # Nights with unreported files, {night_name: results}, and the report states. The output directory is
+        #   scanned again after every report, when new results were added (resultsChanged, at most every
+        #   rescan_interval, as the scan takes long with months of results), and periodically
+        self.pending = None
+        self.states = None
+        self.results_changed = False
+        self.last_scan = None
+        self.scan_interval = 600
+        self.rescan_interval = 60
+
+        # Done flags of the previous scan, see scanNights
+        self.scan_cache = {}
+
+        # Cleanup of old data, at startup, after every report, and periodically. It runs independently of the
+        #   reports, so the free space is kept up also during a long report
+        self.cleanup_proc = None
+        self.cleanup_due = True
+        self.last_cleanup = None
+        self.cleanup_interval = 12*3600
+
+        # Time (monotonic) before which no report or cleanup is started, after a process failed to start
+        #   (e.g. no memory for the fork)
+        self.start_retry_time = 0
+
+        # Upload the night archives only if enabled for the monitor and uploading is enabled in general. The
+        #   upload manager is started right away, so files left in its queue are uploaded after a restart
+        self.upload_manager = None
+        if self.config.monitor_upload and self.config.upload_enabled:
+
+            from RMS.UploadManager import UploadManager
+
+            upload_config = copy.deepcopy(self.config)
+            upload_config.data_dir = output_dir
+
+            # The upload manager stops itself if the monitor is gone (e.g. killed), like the other processes
+            self.upload_manager = UploadManager(upload_config, watch_parent=True)
+            self.upload_manager.start()
+
+
+    def resultsChanged(self):
+        """ Tell the reporter that a file was processed, so the output directory is scanned again. """
+
+        self.results_changed = True
+
+
+    def _lastResultAge(self, results, now):
+        """ Seconds since the latest result of the night was finished. """
+
+        last = max(doneTime(self.output_dir, results_dir) for results_dir in results)
+
+        return (now - last).total_seconds()
+
+
+    def _gaveUp(self, night_name, results):
+        """ True if the report of the night failed twice and no new files arrived since. """
+
+        fail = self.failed.get(night_name)
+
+        return (fail is not None) and (fail['count'] >= 2) and (fail['n_files'] == len(results))
+
+
+    def isDue(self, night_name, results, idle, now):
+        """ Check if the report of the night is due.
+
+        Arguments:
+            night_name: [str] Name of the night.
+            results: [dict] {results_dir: info} of the night.
+            idle: [bool] True if the camera has no files being processed or waiting to be processed.
+            now: [datetime] Current time (UTC).
+
+        Return:
+            [str] Why the report is due ('trigger', 'partial', 'idle' or 'sunrise'), None if it isn't due.
+        """
+
+        # Wait before retrying a failed report, and give up after the second failure until new files arrive
+        fail = self.failed.get(night_name)
+        if (fail is not None) and (fail['n_files'] == len(results)):
+            if (fail['count'] >= 2) or ((now - fail['time']).total_seconds() < self.fail_wait_time):
+                return False
+
+        if night_name in self.triggered:
+            return 'trigger'
+
+        if self.report_mode not in ('sunrise', 'idle'):
+            return None
+
+        # Make the partial report at its time with the data processed until then, once per night. It is not
+        #   made for old nights, e.g. when a backlog is processed after a downtime
+        partial_time = partialReportTime(self.config, night_name)
+        if (partial_time is not None) and (partial_time <= now < partial_time + datetime.timedelta(days=1)):
+
+            # Only a successful report counts, so a failed partial report is made again after the wait
+            night_state = self.states['nights'].get(night_name, {})
+            succeeded_at = night_state.get('succeeded_at', night_state.get('reported_at')
+                                           if 'files' in night_state else None)
+            if (succeeded_at is None) or (datetime.datetime.strptime(succeeded_at, JSON_TIME_FORMAT)
+                                          < partial_time):
+                return 'partial'
+
+        # Wait until no new results of the night came in for a while
+        if self._lastResultAge(results, now) < self.quiet_s:
+            return None
+
+        # In the idle mode, report once all data is processed
+        if self.report_mode == 'idle':
+            return 'idle' if idle else None
+
+        # In the sunrise mode, report once the night is over. The camera doesn't have to be idle, as it may be
+        #   processing the following night already
+        if now >= nightBoundsFromName(self.config, night_name)[1]:
+            return 'sunrise'
+
+        return None
+
+
+    def _overTime(self, proc, timeout, name):
+        """ Stop the process if it runs longer than the timeout (seconds). Return True if it was stopped. """
+
+        if time.monotonic() - proc.start_time < timeout:
+            return False
+
+        log.error(self.log_prefix + "{:s} did not finish in {:.1f} h, stopping it".format(name, timeout/3600))
+        stopProcess(proc, self.log_prefix + name)
+
+        return True
+
+
+    def _startProcess(self, target, args, name):
+        """ Start a report or cleanup process. Return the process, None if it could not be started, in which
+            case starting is tried again after a minute.
+        """
+
+        proc = multiprocessing.Process(target=target, args=args)
+
+        try:
+            proc.start()
+
+        except Exception as e:
+            log.error(self.log_prefix + "{:s} could not be started, trying again in a minute: {:s}".format(
+                name, repr(e)))
+            self.start_retry_time = time.monotonic() + 60
+            return None
+
+        proc.start_time = time.monotonic()
+
+        return proc
+
+
+    def _startCleanup(self):
+        """ Start the cleanup of old data in a separate process. The night being reported is not deleted. """
+
+        protected_nights = [self.active[1]] if (self.active is not None) else []
+
+        args = (self.output_dir, self.config_path, protected_nights, self.input_dir, self.input_ext,
+                self.recursive)
+        self.cleanup_proc = self._startProcess(cleanupWorker, args, "Cleanup")
+
+
+    def _startReport(self, night_name, results, reason):
+        """ Start the report of the night in a separate process. """
+
+        log.info(self.log_prefix + "Starting the {:s} report of night {:s} ({:d} files)".format(
+            reason, night_name, len(results)))
+
+        # Clear the archives of a previous report, so they are not uploaded again if this report fails, and
+        #   record why the report was made
+        updateReportState(self.output_dir, night_name, upload_files=[], trigger=reason)
+
+        proc = self._startProcess(nightReportWorker, (self.output_dir, night_name, self.config_path, results),
+                                  "Report of night {:s}".format(night_name))
+        if proc is None:
+            return
+
+        self.active = (proc, night_name, results)
+        self.report_lock.owner = self
+        self.triggered.discard(night_name)
+
+
+    def _finishReport(self, now):
+        """ Record the result of the finished report and hand its archives over for upload. """
+
+        # The wait is bounded, as a stopped report may be stuck in an uninterruptible call. Such a report
+        #   counts as failed (no exit code)
+        proc, night_name, results = self.active
+        proc.join(10)
+
+        self.active = None
+        self.report_lock.owner = None
+        self.pending = None
+
+        if proc.exitcode == 0:
+            log.info(self.log_prefix + "Report of night {:s} finished".format(night_name))
+            self.failed.pop(night_name, None)
+
+        else:
+            fail = self.failed.get(night_name, {'count': 0})
+            self.failed[night_name] = {'count': fail['count'] + 1, 'time': now, 'n_files': len(results)}
+            log.warning(self.log_prefix + "Report of night {:s} failed (exit code {}), see its log".format(
+                night_name, proc.exitcode))
+
+        if self.upload_manager is not None:
+
+            upload_files = readReportStates(self.output_dir)['nights'][night_name].get('upload_files', [])
+            if upload_files:
+                log.info(self.log_prefix + "Adding files to upload list: {}".format(upload_files))
+                self.upload_manager.addFiles(upload_files)
+                self.upload_manager.delayNextUpload(delay=60*self.config.upload_delay)
+
+
+    def poll(self, idle, now=None):
+        """ Check the running report and cleanup, and start the next due one. Call this from the monitor loop.
+
+        Arguments:
+            idle: [bool] True if the camera has no files being processed or waiting to be processed.
+
+        Keyword arguments:
+            now: [datetime] Current time (UTC), the current time by default.
+        """
+
+        if now is None:
+            now = RmsDateTime.utcnow()
+
+        # Check the running cleanup. It runs independently of the reports, so the free space is kept up
+        if self.cleanup_proc is not None:
+            if (not self.cleanup_proc.is_alive()) \
+                    or self._overTime(self.cleanup_proc, CLEANUP_TIMEOUT, "Cleanup"):
+
+                self.cleanup_proc.join(10)
+                self.cleanup_proc = None
+
+                # The cleanup may have deleted nights, so the pending nights are found again
+                self.pending = None
+
+        # Check the running report. A report which takes too long is stopped and counts as failed
+        if self.active is not None:
+            if self.active[0].is_alive() and (not self._overTime(self.active[0], REPORT_TIMEOUT,
+                    "Report of night {:s}".format(self.active[1]))):
+                pass
+            else:
+                self._finishReport(now)
+                self.cleanup_due = True
+
+        # Start the cleanup when it's due, also while a report runs
+        if (self.cleanup_proc is None) and (time.monotonic() >= self.start_retry_time) \
+                and (self.cleanup_due or ((now - self.last_cleanup).total_seconds() > self.cleanup_interval)):
+
+            # The cleanup stays due until it was started
+            self._startCleanup()
+            if self.cleanup_proc is not None:
+                self.cleanup_due = False
+                self.last_cleanup = now
+
+        # One report at a time, and no report starts while the cleanup runs, as it may delete its night
+        if (self.active is not None) or (self.cleanup_proc is not None) \
+                or (time.monotonic() < self.start_retry_time):
+            return
+
+        if self.report_mode == 'none':
+            return
+
+        # The trigger file requests the reports of all nights with new data
+        trigger_path = os.path.join(self.output_dir, REPORT_TRIGGER_FILE_NAME)
+        trigger = os.path.exists(trigger_path)
+        if trigger:
+            os.remove(trigger_path)
+            self.pending = None
+
+            # The operator asks for the reports, so nights which failed are tried again right away
+            self.failed = {}
+
+        # Find the nights with unreported files
+        scan_age = (now - self.last_scan).total_seconds() if (self.last_scan is not None) else None
+        if (self.pending is None) or (scan_age > self.scan_interval) \
+                or (self.results_changed and (scan_age > self.rescan_interval)):
+
+            self.results_changed = False
+
+            self.states = readReportStates(self.output_dir)
+            self.pending = {night_name: results
+                            for night_name, results in scanNights(self.output_dir, self.config,
+                                                                  cache=self.scan_cache).items()
+                            if isPending(self.output_dir, self.config, self.states, night_name, results)}
+            self.last_scan = now
+
+        if trigger:
+            log.info(self.log_prefix + "Report trigger file found, reporting {:d} night(s) with new "
+                     "data".format(len(self.pending)))
+            self.triggered |= set(self.pending)
+
+        # Forget triggered nights which were reported or given up
+        self.triggered = set(night_name for night_name in self.triggered if (night_name in self.pending)
+                             and not self._gaveUp(night_name, self.pending[night_name]))
+
+        # Report the oldest due night, if no other camera is reporting. Wait for the scan of new results, so
+        #   the report includes them
+        if (self.report_lock.owner is not None) or self.results_changed:
+            return
+
+        for night_name in sorted(self.pending):
+            reason = self.isDue(night_name, self.pending[night_name], idle, now)
+            if reason:
+                self._startReport(night_name, self.pending[night_name], reason)
+                break
+
+
+    def stop(self, timeout=300):
+        """ Wait for the running report and cleanup, and stop the upload manager.
+
+        Keyword arguments:
+            timeout: [float] Seconds to wait for each process before terminating it. 300 by default.
+        """
+
+        if self.cleanup_proc is not None:
+            self.cleanup_proc.join(timeout=timeout)
+
+            if self.cleanup_proc.is_alive():
+                log.warning(self.log_prefix + "Cleanup did not finish in time, terminating")
+                self.cleanup_proc.terminate()
+
+            self.cleanup_proc = None
+
+        if self.active is not None:
+            proc, night_name, _ = self.active
+            proc.join(timeout=timeout)
+
+            if proc.is_alive():
+                log.warning(self.log_prefix + "Report of night {:s} did not finish in time, "
+                            "terminating".format(night_name))
+                proc.terminate()
+                self.active = None
+                self.report_lock.owner = None
+
+            # Finish the report which completed, so its archives are handed over for upload
+            else:
+                self._finishReport(RmsDateTime.utcnow())
+
+        # The upload queue is kept on disk, so an interrupted upload continues after a restart. The upload
+        #   manager is stopped here instead of with its stop method, whose final wait is not bounded
+        if self.upload_manager is not None:
+            self.upload_manager.exit.set()
+            self.upload_manager.join(timeout)
+            if self.upload_manager.is_alive():
+                log.warning(self.log_prefix + "The upload manager did not stop in time, terminating it")
+                stopProcess(self.upload_manager, self.log_prefix + "Upload manager")
+
+            self.upload_manager = None
+
+
+
+if __name__ == "__main__":
+
+    arg_parser = argparse.ArgumentParser(description="Generate the night reports for data processed by "
+        "RMS.MonitorProcessFrameInterface. Don't run it while the monitor is reporting the same output "
+        "directory, create the trigger file " + REPORT_TRIGGER_FILE_NAME + " instead.")
+
+    arg_parser.add_argument('output_dir', type=str,
+        help="Output directory of the monitor.")
+
+    arg_parser.add_argument('--night', '-n', type=str, default=None,
+        help="Name of the night to report (a directory in CapturedFiles). All nights with new data by "
+             "default.")
+
+    arg_parser.add_argument('--all', '-a', action='store_true',
+        help="Report all nights, also the ones without new data.")
+
+    arg_parser.add_argument('--config', '-c', type=str, default=None,
+        help="Path to the config file. By default, the config copied to the results of the night is used.")
+
+    arg_parser.add_argument('--no_archive', action='store_true',
+        help="Don't archive the night into ArchivedFiles. The archives are never uploaded by this script.")
+
+    cml_args = arg_parser.parse_args()
+
+    output_dir = os.path.abspath(cml_args.output_dir)
+
+    # Don't report next to a running monitor
+    output_lock = lockOutputDir(output_dir)
+    if output_lock is None:
+        print("A monitor (PID {:s}) is using {:s}, create the {:s} file in it to report the nights with new "
+              "data instead.".format(lockOwner(output_dir), output_dir, REPORT_TRIGGER_FILE_NAME))
+        sys.exit(1)
+
+    given_config = cr.parse(os.path.abspath(cml_args.config)) if cml_args.config else None
+    nights = scanNights(output_dir, given_config if (given_config is not None) else cr.Config())
+    states = readReportStates(output_dir)
+
+    def _nightConfig(night_name):
+        """ The given config, otherwise the config copied to the results of the night. None if the results
+            were pruned (the night was deleted by the cleanup).
+        """
+
+        if given_config is not None:
+            return given_config
+
+        for results_dir in sorted(nights[night_name]):
+            config_paths = sorted(glob.glob(os.path.join(output_dir, results_dir, '*.config')))
+            if config_paths:
+                return cr.parse(config_paths[0])
+
+        return None
+
+    # The night directories are checked with the config of each night, as it defines their location
+    night_configs = {night_name: _nightConfig(night_name) for night_name in nights}
+    nights = {night_name: results for night_name, results in nights.items()
+              if night_configs[night_name] is not None}
+
+    if cml_args.night is not None:
+        night_names = [cml_args.night] if cml_args.night in nights else []
+
+    # Nights whose directory was deleted by the cleanup are not reported
+    elif cml_args.all:
+        night_names = sorted(night_name for night_name in nights if os.path.isdir(
+            nightDirPath(output_dir, night_name, night_configs[night_name])))
+
+    else:
+        night_names = sorted(night_name for night_name, results in nights.items()
+                             if isPending(output_dir, night_configs[night_name], states, night_name, results))
+
+    if not night_names:
+        print("No nights to report.")
+        sys.exit(0)
+
+    exit_code = 0
+    for night_name in night_names:
+
+        config = night_configs[night_name]
+
+        _initWorkerLogging(config, output_dir, 'report_{:s}_'.format(night_name))
+
+        night_state = generateNightReport(output_dir, night_name, config, results=nights[night_name],
+                                          archive=(not cml_args.no_archive))
+
+        print("Night {:s}: ok steps: {:s}, failed steps: {:s}".format(night_name,
+            ", ".join(night_state['ok_steps']), ", ".join(night_state['failed_steps']) or "none"))
+
+        if ESSENTIAL_STEPS & set(night_state['failed_steps']):
+            exit_code = 1
+
+    sys.exit(exit_code)

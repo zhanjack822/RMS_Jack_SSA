@@ -28,15 +28,15 @@ import numpy as np
 import RMS.ConfigReader as cr
 from RMS.Formats import FTPdetectinfo
 from RMS.Formats import CALSTARS
-from RMS.Formats.FFfile import validFFName, constructFFName
+from RMS.Formats.FFfile import validFFName, constructFFName, filenameToDatetime
 from RMS.Formats.FrameInterface import detectInputType, detectInputTypeFile, checkIfVideoFile
 from RMS.ExtractStars import extractStarsFF
 from RMS.ExtractStarsFrameInterface import extractStarsFrameInterface
-from RMS.Detection import detectMeteors
+from RMS.Detection import detectMeteors, subframePickTime
 from RMS.DetectionTools import loadImageCalibration
 from RMS.QueuedPool import QueuedPool
 from RMS.Logger import LoggingManager, getLogger
-from RMS.Misc import RmsDateTime, mkdirP
+from RMS.Misc import RmsDateTime, mkdirP, setMultiprocessingStartMethod
 
 
 # Get the logger from the main module
@@ -46,7 +46,7 @@ log = getLogger("rmslogger")
 
 def detectStarsAndMeteorsFrameInterface(
         img_handle, config, 
-        flat_struct=None, dark=None, mask=None, chunk_frames=128
+        flat_struct=None, dark=None, mask=None, chunk_frames=128, chunk_callback=None
         ):
     """ Extract stars and detect meteors on the given image handle. This is most useful for videos and 
         directories with images.
@@ -60,6 +60,8 @@ def detectStarsAndMeteorsFrameInterface(
         dark: [ndarray]
         mask: [MaskStruct]
         chunk_frames: [int] Number of frames to stacked image on which the stars will be extracted.
+        chunk_callback: [callable] Called for every star extraction chunk, see
+            ExtractStars.extractStarsImgHandle. None by default.
 
     Return:
         [img_handle, star_list, meteor_list]:
@@ -71,23 +73,13 @@ def detectStarsAndMeteorsFrameInterface(
 
     log.info('Running detection on file: ' + img_handle.file_name)
     
-    # Load mask, dark, flat
-    mask, dark, flat_struct = loadImageCalibration(img_handle.dir_path, config, dtype=img_handle.ff.dtype, 
-                                                  byteswap=img_handle.byteswap)
-    
     # Run star extraction on the image handle
     star_list = extractStarsFrameInterface(img_handle, config, chunk_frames=chunk_frames, 
-        flat_struct=flat_struct, dark=dark, mask=mask, save_calstars=False)
+        flat_struct=flat_struct, dark=dark, mask=mask, save_calstars=False, chunk_callback=chunk_callback)
     
 
     # Get the maximum number of stars on any chunks
-    try:
-        
-        max_stars = max([len(star_entry[1]) for star_entry in star_list if len(star_entry) > 1]) \
-                    if star_list else 0
-    
-    except (IndexError, TypeError, ValueError):
-        max_stars = 0
+    max_stars = max([len(star_data) for _, star_data in star_list]) if star_list else 0
 
     
     log.info('Max. detected stars on all frame chunks: {:d}'.format(max_stars))
@@ -113,7 +105,36 @@ def detectStarsAndMeteorsFrameInterface(
     return star_list, meteor_list
 
 
-def saveResultsFrameInterface(star_list, meteor_list, img_handle, config, chunk_frames=128, output_suffix='', output_dir=None, write_empty=True):
+def chunkForFrame(chunk_images, frame):
+    """ Find the saved chunk which contains the given frame.
+
+    Arguments:
+        chunk_images: [list] List of (first_frame, nframes, ff_name) of the saved chunks, sorted by the first
+            frame.
+        frame: [float] Frame number.
+
+    Return:
+        [str] FF name of the chunk which contains the frame. If no chunk contains it, the name of the last
+            chunk which starts before the frame, or None if there is no such chunk.
+    """
+
+    preceding = None
+
+    for first_frame, nframes, ff_name in chunk_images:
+
+        if first_frame > frame:
+            break
+
+        if frame < first_frame + nframes:
+            return ff_name
+
+        preceding = ff_name
+
+    return preceding
+
+
+def saveResultsFrameInterface(star_list, meteor_list, img_handle, config, chunk_frames=128, output_suffix='',
+                              output_dir=None, write_empty=True, chunk_images=None):
     """ Save detection results to CALSTARS and FTPdetectinfo files.
     
     Arguments:
@@ -125,6 +146,9 @@ def saveResultsFrameInterface(star_list, meteor_list, img_handle, config, chunk_
     Keyword arguments:
         chunk_frames: [int] Number of frames to stacked image on which the stars will be extracted.
         output_suffix: [str] Suffix to add to the output files.
+        chunk_images: [list] List of (first_frame, nframes, ff_name) of chunks saved as FF image pairs. If
+            given, every meteor is assigned to the chunk which contains its first pick, and its frames are
+            given relative to the beginning of the chunk. None by default.
 
     Return:
         [output_dir, calstars_name, ftpdetectinfo_name]: The output directory and file names
@@ -134,8 +158,9 @@ def saveResultsFrameInterface(star_list, meteor_list, img_handle, config, chunk_
     if output_dir is None:
         output_dir = img_handle.dir_path
 
-    # Construct the name of the CALSTARS file by using the camera code and the time of the first frame
-    timestamp = img_handle.beginning_datetime.strftime("%Y%m%d_%H%M%S_%f")
+    # Construct the name of the CALSTARS file by using the camera code and the time of the first frame (of the input
+    #   itself for an input with frames of another one in front, see RMS.Formats.FrameChain)
+    timestamp = getattr(img_handle, 'name_datetime', img_handle.beginning_datetime).strftime("%Y%m%d_%H%M%S_%f")
     prefix = "{:s}_{:s}".format(config.stationID, timestamp)
 
     suffix = ''
@@ -168,30 +193,55 @@ def saveResultsFrameInterface(star_list, meteor_list, img_handle, config, chunk_
         ftpdetectinfo_name = 'FTPdetectinfo_' + prefix + suffix + '.txt'
 
         results_list = []
-        meteor_No = 1
+
+        # Meteors are numbered per FF name, as several meteors can be in the same chunk
+        meteor_counts = {}
+
         for meteor in meteor_list:
 
             rho, theta, centroids = meteor
 
-            # Get the time of the first frame in the detection
-            first_pick_time = img_handle.currentFrameTime(frame_no=int(centroids[0][0]), dt_obj=True)
+            # Measured fps to write for this meteor (None -> use the config fps)
+            meteor_fps = None
+
+            # Find the saved chunk image which contains the first pick
+            chunk_name = chunkForFrame(chunk_images, centroids[0][0]) if chunk_images else None
 
             # Construct FF file name if it's not available
             if img_handle.input_type == 'ff':
                 ff_file_name = img_handle.name()
 
-            # For non-FF inputs, construct the FF name from the station ID and the first pick time
-            # To keep an accurate time, reset the frames so that the first pick is at frame 0
+            # Non-FF inputs: assign the meteor to the saved chunk, or name it after the time of the first pick
+            #   if the chunk images are not saved. The frames are computed from the real frame times relative
+            #   to the time in the name, using the measured fps (rounded to the precision stored in the
+            #   FTPdetectinfo file), so the time of every pick is recovered exactly as name time + frame/fps,
+            #   also if the frame rate differs from the config or frames were dropped
             else:
-                ff_file_name = constructFFName(config.stationID, first_pick_time)
 
-                # Reset the frame numbers so that the first pick is at frame 0 
-                # frame[i] - int(frame[0]) to preserve the rolling shutter correction encoded as the 
-                #   fractional part of the frame number
-                centroids[:,0] -= int(centroids[0,0])
+                if chunk_name is not None:
+                    ff_file_name = chunk_name
+                else:
+                    first_pick_time = img_handle.currentFrameTime(frame_no=int(centroids[0][0]), dt_obj=True)
+                    ff_file_name = constructFFName(config.stationID, first_pick_time)
+
+                fps_meas = round(img_handle.fps, 2)
+                ref_time = filenameToDatetime(ff_file_name)
+
+                centroids = np.array(centroids, dtype=np.float64)
+                for entry in centroids:
+                    entry[0] = (subframePickTime(img_handle, entry[0], fps_meas) - ref_time).total_seconds()\
+                        *fps_meas
+
+                meteor_fps = fps_meas
+
+            meteor_counts[ff_file_name] = meteor_counts.get(ff_file_name, 0) + 1
+            meteor_No = meteor_counts[ff_file_name]
 
             # Append to the results list
-            results_list.append([ff_file_name, meteor_No, rho, theta, centroids])
+            if meteor_fps is not None:
+                results_list.append([ff_file_name, meteor_No, rho, theta, centroids, meteor_fps])
+            else:
+                results_list.append([ff_file_name, meteor_No, rho, theta, centroids])
 
         # Write FTPdetectinfo file
         FTPdetectinfo.writeFTPdetectinfo(results_list, output_dir, ftpdetectinfo_name,
@@ -215,11 +265,16 @@ def detectStarsAndMeteors(ff_directory, ff_name, config, flat_struct=None, dark=
         mask: [MaskStruct]
 
     Return:
-        [ff_name, star_list, meteor_list] detected stars and meteors
+        [ff_name, star_list, meteor_list, diagnostics] detected stars and meteors, and the detection
+            diagnostics dict (white ratio checks, see Detection.getLines), empty if meteor detection
+            did not run.
 
     """
 
     log.info('Running detection on file: ' + ff_name)
+
+    # Detection diagnostics, filled in by the meteor detection
+    diagnostics = {}
 
 
     # Construct the image handle for the detection
@@ -232,7 +287,7 @@ def detectStarsAndMeteors(ff_directory, ff_name, config, flat_struct=None, dark=
 
         # If the FF file could not be loaded, skip it
         if img_handle.ff is None:
-            return ff_name, [[], [], [], []], []
+            return ff_name, [[], [], [], []], [], diagnostics
 
 
 
@@ -255,7 +310,8 @@ def detectStarsAndMeteors(ff_directory, ff_name, config, flat_struct=None, dark=
         log.info('At least ' + str(config.ff_min_stars) + ' stars, detecting meteors...')
 
         # Run the detection
-        meteor_list = detectMeteors(img_handle, config, flat_struct=flat_struct, dark=dark, mask=mask)
+        meteor_list = detectMeteors(img_handle, config, flat_struct=flat_struct, dark=dark, mask=mask, \
+            diagnostics=diagnostics)
 
         log.info(ff_name + ' detected meteors: ' + str(len(meteor_list)))
 
@@ -264,7 +320,76 @@ def detectStarsAndMeteors(ff_directory, ff_name, config, flat_struct=None, dark=
 
 
 
-    return ff_name, star_list, meteor_list
+    return ff_name, star_list, meteor_list, diagnostics
+
+
+
+# Fraction of the night's meteor detection runs skipped by the white ratio check above which the night is
+# reported as a threshold fault. A healthy station skips a few images a night at most (measured ~7 in
+# 90,000 FFs across 20 stations), even in bad weather, since bright sky raises stdpixel together with
+# the signal and cloudy images rarely have enough stars for meteor detection to run at all. A station
+# whose threshold sits below its noise floor skips nearly every clear image and is blind to meteors.
+WHITE_RATIO_SKIP_WARN_FRACTION = 0.5
+
+# Minimum number of meteor detection runs before the fraction above is judged, so a handful of twilight
+# images at the start or end of a night cannot trip it
+WHITE_RATIO_SKIP_MIN_IMAGES = 10
+
+
+def reportWhiteRatioSkips(detection_results):
+    """ Warn once for the night if meteor detection was skipped by the white ratio check on most images
+        it ran on. A single skipped image is normal and stays at debug level in the detection; only a
+        night that is mostly skipped is a fault worth an operator's attention.
+
+    Arguments:
+        detection_results: [list] Outputs of detectStarsAndMeteors, with the diagnostics dict.
+
+    Return:
+        skipped: [int] Number of images on which meteor detection was skipped.
+        checked: [int] Number of images on which meteor detection ran.
+    """
+
+    checked = 0
+    skipped = 0
+    white_ratios = []
+    excess_medians = []
+    std_medians = []
+
+    for _, _, _, diagnostics in detection_results:
+
+        # Only count images on which meteor detection ran (enough stars), so cloudy images stay out of
+        # the denominator
+        checks = diagnostics.get('white_ratio_checks', 0)
+        if checks == 0:
+            continue
+
+        checked += 1
+
+        # An image is skipped when every one of its checks failed (one per FF, one per time window for
+        # other inputs)
+        if diagnostics.get('white_ratio_rejections', 0) == checks:
+
+            skipped += 1
+            white_ratios.append(diagnostics['white_ratio_max'])
+            excess_medians.append(diagnostics['maxpixel_excess_median'])
+            std_medians.append(diagnostics['stdpixel_median'])
+
+
+    if (checked >= WHITE_RATIO_SKIP_MIN_IMAGES) and (skipped > WHITE_RATIO_SKIP_WARN_FRACTION*checked):
+
+        log.warning(("Meteor detection was skipped on {:d} of {:d} images with enough stars ({:.0f}%) "
+            "because more than max_white_ratio of the frame passed the k1/j1 threshold (median white "
+            "ratio {:.2f}). The k1*stdpixel + j1 threshold sits below the maxpixel noise floor, so the "
+            "station is blind to meteors on clear sky. Bright sky does not do this, as it raises "
+            "stdpixel with the signal. On the skipped images the median maxpixel - avepixel is {:.1f} "
+            "ADU against a median stdpixel of {:.1f} ADU: if the excess is many times the stdpixel, "
+            "the video path smooths per-pixel temporal noise (software re-encoded or some IP camera "
+            "streams), otherwise k1/j1 are too low for this camera. Raise j1 (or k1).").format(
+            skipped, checked, 100.0*skipped/checked, np.median(white_ratios), np.median(excess_medians),
+            np.median(std_medians)))
+
+
+    return skipped, checked
 
 
 
@@ -296,21 +421,28 @@ def saveDetections(detection_results, ff_dir, config, output_suffix=''):
     # Remove all 'None' results, which were errors
     detection_results = [res for res in detection_results if res is not None]
 
+    # Results restored from detection backups written before the diagnostics were added have three
+    # elements
+    detection_results = [tuple(res) + ({},) if len(res) == 3 else tuple(res) for res in detection_results]
+
     # Sort by FF name
     detection_results = sorted(detection_results, key=lambda x: x[0])
 
 
     # Count the number of detected meteors
     meteors_num = 0
-    for _, _, meteor_data in detection_results:
+    for _, _, meteor_data, _ in detection_results:
         for meteor in meteor_data:
             meteors_num += 1
 
     log.info('TOTAL: ' + str(meteors_num) + ' detected meteors.')
 
+    # Report a night on which the white ratio check skipped most of the meteor detection
+    reportWhiteRatioSkips(detection_results)
+
 
     # Save the detections to a file
-    for ff_name, star_data, meteor_data in detection_results:
+    for ff_name, star_data, meteor_data, _ in detection_results:
 
 
         if len(star_data) == 4:
@@ -430,7 +562,7 @@ def detectStarsAndMeteorsDirectory(dir_path, config, output_suffix=''):
 
     # Initialize the detector
     detector = QueuedPool(detectStarsAndMeteors, cores=config.num_cores, log=log, backup_dir=ff_dir, \
-        input_queue_maxsize=None)
+        input_queue_maxsize=None, config=config)
 
     # Start the detection
     detector.startPool()
@@ -461,6 +593,7 @@ def detectStarsAndMeteorsDirectory(dir_path, config, output_suffix=''):
 
     # Get the detection results from the queue
     detection_results = detector.getResults()
+    detector.shutdownManager()
 
 
     # Save detection to disk
@@ -529,6 +662,10 @@ def detectStarsAndMeteorsInVideoFile(video_path, config, chunk_frames=None, outp
 
 
 if __name__ == "__main__":
+
+    # Pin the multiprocessing start method for consistent behavior across Python versions
+    # (3.6-3.14). Must be done before any Process/Pool is created.
+    setMultiprocessingStartMethod()
 
     ### COMMAND LINE ARGUMENTS
 

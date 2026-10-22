@@ -454,6 +454,36 @@ def sizeBz2Files(config):
     return n
 
 
+def keptPathSet(keep_paths):
+    """ Normalize the paths which must not be deleted, so they can be compared to the paths found on disk.
+
+    Arguments:
+        keep_paths: [list] Paths of directories or files, or None. None entries are ignored.
+
+    Return:
+        [set] Real paths of the kept objects.
+    """
+
+    if not keep_paths:
+        return set()
+
+    return set(os.path.realpath(path) for path in keep_paths if path)
+
+
+def isKept(path, keep):
+    """ Check if the path is one of the kept objects.
+
+    Arguments:
+        path: [str] Path of a directory or a file.
+        keep: [set] Real paths of the kept objects, made by keptPathSet.
+
+    Return:
+        [bool] True if the object must not be deleted.
+    """
+
+    return bool(keep) and (os.path.realpath(path) in keep)
+
+
 def getNightDirs(dir_path, stationID):
     """ Returns a sorted list of directories in the given directory which conform to the captured directories
         names. 
@@ -588,7 +618,7 @@ def getBz2Files(dir_path, stationID):
 
 
 
-def deleteNightFolders(dir_path, config, delete_all=False):
+def deleteNightFolders(dir_path, config, delete_all=False, keep=None):
     """ Deletes captured data directories to free up disk space. Either only one directory will be deleted
         (the oldest one), or all directories will be deleted (if delete_all = True).
 
@@ -598,14 +628,17 @@ def deleteNightFolders(dir_path, config, delete_all=False):
 
     Keyword arguments:
         delete_all: [bool] If True, all data folders will be deleted. False by default.
+        keep: [set] Real paths of the directories which must not be deleted (see keptPathSet). None by
+            default.
 
     Return:
-        dir_list: [list] A list of remaining night directories in the data directory.
+        dir_list: [list] A list of remaining night directories in the data directory, without the kept ones.
 
     """
 
-    # Get the list of night directories
-    dir_list = getNightDirs(dir_path, config.stationID)
+    # Get the list of night directories, the kept ones are neither deleted nor counted as remaining
+    dir_list = [dir_name for dir_name in getNightDirs(dir_path, config.stationID)
+        if not isKept(os.path.join(dir_path, dir_name), keep)]
 
     # Delete the night directories
     for dir_name in dir_list:
@@ -622,7 +655,8 @@ def deleteNightFolders(dir_path, config, delete_all=False):
 
 
     # Return the list of remaining night directories
-    return getNightDirs(dir_path, config.stationID)
+    return [dir_name for dir_name in getNightDirs(dir_path, config.stationID)
+        if not isKept(os.path.join(dir_path, dir_name), keep)]
 
 
 def deleteRawItems(dir_path, delete_all=False, in_video_dir=False, unique=False):
@@ -705,7 +739,7 @@ def getFiles(dir_path, stationID):
 
 
 
-def deleteFiles(dir_path, config, delete_all=False):
+def deleteFiles(dir_path, config, delete_all=False, keep=None):
     """ Deletes data files free up disk space. Either only one file will be deleted
         (the oldest one), or all files will be deleted (if delete_all = True).
 
@@ -715,14 +749,16 @@ def deleteFiles(dir_path, config, delete_all=False):
 
     Keyword arguments:
         delete_all: [bool] If True, all data folders will be deleted. False by default.
+        keep: [set] Real paths of the files which must not be deleted (see keptPathSet). None by default.
 
     Return:
-        file_list: [list] A list of remaining files in the data directory.
+        file_list: [list] A list of remaining files in the data directory, without the kept ones.
 
     """
 
-    # Get sorted list of files in dir_path
-    file_list = getFiles(dir_path, config.stationID)
+    # Get sorted list of files in dir_path, the kept ones are neither deleted nor counted as remaining
+    file_list = [file_name for file_name in getFiles(dir_path, config.stationID)
+        if not isKept(os.path.join(dir_path, file_name), keep)]
 
     # Delete first file or all files
     for file_name in file_list:
@@ -736,12 +772,14 @@ def deleteFiles(dir_path, config, delete_all=False):
         if not delete_all:
             break
 
-    return getFiles(dir_path, config.stationID)
+    return [file_name for file_name in getFiles(dir_path, config.stationID)
+        if not isKept(os.path.join(dir_path, file_name), keep)]
 
 
 
 
-def deleteOldObservations(data_dir, captured_dir, archived_dir, config, duration=None):
+def deleteOldObservations(data_dir, captured_dir, archived_dir, config, duration=None, needed_bytes=None,
+    keep_paths=None):
     """ Deletes old observation directories to free up space for new ones.
 
     Arguments:
@@ -753,6 +791,10 @@ def deleteOldObservations(data_dir, captured_dir, archived_dir, config, duration
     Keyword arguments:
         duration: [float] Duration of next video capturing in seconds. If None (by default), duration will
             be calculated for the next night.
+        needed_bytes: [float] Disk space needed for the next night in bytes, used instead of the estimate
+            from the capture settings. None by default.
+        keep_paths: [list] Night directories and archive files which must not be deleted, e.g. a night which
+            was just processed and whose archives are still waiting to be uploaded. None by default.
 
     Return:
         [bool]: True if there's enough space for the next night's data, False if not.
@@ -765,13 +807,16 @@ def deleteOldObservations(data_dir, captured_dir, archived_dir, config, duration
     video_dir = os.path.join(data_dir, config.video_dir)
     times_dir = os.path.join(data_dir, config.times_dir)
 
+    # Objects which must not be deleted
+    keep = keptPathSet(keep_paths)
+
     # clear down logs first
     log.info('clearing down log files')
     deleteOldLogfiles(data_dir, config)
 
     # next purge out any old ArchivedFiles folders, compressed files, and video clips
     log.info('clearing down old data')
-    deleteOldDirs(data_dir, config)
+    deleteOldDirs(data_dir, config, keep=keep)
 
 
     if config.quota_management_enabled:
@@ -793,7 +838,7 @@ def deleteOldObservations(data_dir, captured_dir, archived_dir, config, duration
                 log.warning("No quota allocation remains for captured directories, please increase rms_data_quota")
                 capt_dir_quota = 0
 
-            deleteByQuota(archived_dir, capt_dir_quota, captured_dir, config)
+            deleteByQuota(archived_dir, capt_dir_quota, captured_dir, config, keep=keep)
 
     # Calculate the approximate needed disk space for the next night
 
@@ -811,8 +856,16 @@ def deleteOldObservations(data_dir, captured_dir, archived_dir, config, duration
         o.elevation = config.elevation
         sun = ephem.Sun()
 
-        sunrise = o.previous_rising(sun, start=ephem.now())
-        noon_time = o.next_transit(sun, start=sunrise).datetime()
+        try:
+            sunrise = o.previous_rising(sun, start=ephem.now())
+            noon_time = o.next_transit(sun, start=sunrise).datetime()
+
+        except (ephem.NeverUpError, ephem.AlwaysUpError):
+            # Polar night/day: the Sun never crosses the horizon, so there is no
+            # rising/transit. captureDuration() below handles polar conditions
+            # itself, so fall back to the current time as the reference point.
+            log.warning("Polar day/night: no Sun rising/transit; using current time for disk estimate")
+            noon_time = RmsDateTime.utcnow()
 
         # if ct.hour > 12:
         #     noon_time += datetime.timedelta(days=1)
@@ -856,6 +909,9 @@ def deleteOldObservations(data_dir, captured_dir, archived_dir, config, duration
 
     ######
 
+    if needed_bytes is not None:
+        next_night_bytes = needed_bytes
+
     log.info("Need {:.2f} GB for next night".format(next_night_bytes/1024/1024/1024))
 
 
@@ -896,7 +952,7 @@ def deleteOldObservations(data_dir, captured_dir, archived_dir, config, duration
 
 
         # Delete one captured directory
-        captured_dirs_remaining = deleteNightFolders(captured_dir, config)
+        captured_dirs_remaining = deleteNightFolders(captured_dir, config, keep=keep)
 
         log.info("Deleted dir in captured directory: {:s}".format(captured_dir))
         log.info("Free space: {:.2f} GB".format(availableSpace(data_dir)/1024/1024/1024))
@@ -908,7 +964,7 @@ def deleteOldObservations(data_dir, captured_dir, archived_dir, config, duration
 
 
         # Delete one archived directory
-        archived_dirs_remaining = deleteNightFolders(archived_dir, config)
+        archived_dirs_remaining = deleteNightFolders(archived_dir, config, keep=keep)
 
         log.info("Deleted dir in archived directory: {:s}".format(archived_dir))
         log.info("Free space: {:.2f} GB".format(availableSpace(data_dir)/1024/1024/1024))
@@ -942,7 +998,7 @@ def deleteOldObservations(data_dir, captured_dir, archived_dir, config, duration
 
             log.info("Deleted all Capture, Archived, Frame, Video and Time directories, deleting archived bz2 files...")
 
-            archived_files_remaining = deleteFiles(archived_dir, config)
+            archived_files_remaining = deleteFiles(archived_dir, config, keep=keep)
 
             # If there's nothing left to delete, return False
             if len(archived_files_remaining) == 0:
@@ -987,7 +1043,7 @@ def deleteOldObservations(data_dir, captured_dir, archived_dir, config, duration
     return True
 
 
-def deleteByQuota(archived_dir, capt_dir_quota, captured_dir, config):
+def deleteByQuota(archived_dir, capt_dir_quota, captured_dir, config, keep=None):
     """
     By quotas deletes the oldest files in each section. This method does
     not delete log files.
@@ -997,6 +1053,8 @@ def deleteByQuota(archived_dir, capt_dir_quota, captured_dir, config):
         capt_dir_quota (): Quota for captured directories
         captured_dir (): Path to the captured directoreis
         config (): Station config
+        keep (): optional, set of real paths of night directories and archives which must not be deleted
+            (see keptPathSet)
 
     Returns:
         None
@@ -1009,14 +1067,17 @@ def deleteByQuota(archived_dir, capt_dir_quota, captured_dir, config):
 
     # Manage size of the captured directory
     delete_list = objectsToDelete(captured_dir, config.stationID, capt_dir_quota, bz2=False)
+    delete_list = [path for path in delete_list if not isKept(path, keep)]
     rmList(delete_list, dummy_run= not config.quota_management_enabled)
 
     # Manage the size of the archived directory
     delete_list = objectsToDelete(archived_dir, config.stationID, config.arch_dir_quota, bz2=False)
+    delete_list = [path for path in delete_list if not isKept(path, keep)]
     rmList(delete_list, dummy_run= not config.quota_management_enabled)
 
     # Manage the size of the bz2 files
     delete_list = objectsToDelete(archived_dir, config.stationID, config.bz2_files_quota, bz2=True)
+    delete_list = [path for path in delete_list if not isKept(path, keep)]
     rmList(delete_list, dummy_run= not config.quota_management_enabled)
 
     # Manage the size of the log files
@@ -1034,18 +1095,30 @@ def deleteByQuota(archived_dir, capt_dir_quota, captured_dir, config):
     log.info(quotaReport(capt_dir_quota, config, after=True))
 
 
-def deleteOldDirs(data_dir, config):
+def deleteOldDirs(data_dir, config, keep=None):
+    """ Deletes the oldest night directories, raw data and archives above the configured counts to keep.
+
+    Arguments:
+        data_dir: [str] Path to the RMS data directory.
+        config: [Configuration object]
+
+    Keyword arguments:
+        keep: [set] Real paths of the night directories and archive files which must not be deleted (see
+            keptPathSet). They do not count towards the numbers to keep. None by default.
+    """
 
     # Deleting old archived dirs
     archived_dir = os.path.join(data_dir, config.archived_dir)
     orig_count = 0
     final_count = 0
     if config.arch_dirs_to_keep > 0:
-        archdir_list = getNightDirs(archived_dir, config.stationID)
+        # The kept directories are neither counted nor deleted
+        archdir_list = [dir_name for dir_name in getNightDirs(archived_dir, config.stationID)
+            if not isKept(os.path.join(archived_dir, dir_name), keep)]
         orig_count = len(archdir_list)
         while len(archdir_list) > config.arch_dirs_to_keep:
             prev_length = len(archdir_list)
-            archdir_list = deleteNightFolders(archived_dir, config)
+            archdir_list = deleteNightFolders(archived_dir, config, keep=keep)
             if len(archdir_list) == prev_length:
                 log.error("Failed to delete folder from ArchivedFiles. Exiting loop.")
                 break
@@ -1058,11 +1131,13 @@ def deleteOldDirs(data_dir, config):
     final_count = 0
     captured_dir = os.path.join(data_dir, config.captured_dir)
     if config.capt_dirs_to_keep > 0:
-        captdir_list = getNightDirs(captured_dir, config.stationID)
+        # The kept directories are neither counted nor deleted
+        captdir_list = [dir_name for dir_name in getNightDirs(captured_dir, config.stationID)
+            if not isKept(os.path.join(captured_dir, dir_name), keep)]
         orig_count = len(captdir_list)
         while len(captdir_list) > config.capt_dirs_to_keep:
             prev_length = len(captdir_list)
-            captdir_list = deleteNightFolders(captured_dir, config)
+            captdir_list = deleteNightFolders(captured_dir, config, keep=keep)
             if len(captdir_list) == prev_length:
                 log.error("Failed to delete folder from CapturedFiles. Exiting loop.")
                 break
@@ -1125,7 +1200,9 @@ def deleteOldDirs(data_dir, config):
     orig_count = 0
     final_count = 0
     if config.bz2_files_to_keep > 0:
-        bz2_list = getBz2Files(archived_dir, config.stationID)
+        # The kept archives are neither counted nor deleted
+        bz2_list = [file_name for file_name in getBz2Files(archived_dir, config.stationID)
+            if not isKept(os.path.join(archived_dir, file_name), keep)]
         orig_count = len(bz2_list)
         while len(bz2_list) > config.bz2_files_to_keep:
             try:
@@ -1139,13 +1216,14 @@ def deleteOldDirs(data_dir, config):
     return
 
 
-def deleteOldLogfiles(data_dir, config, days_to_keep=None):
+def deleteOldLogfiles(data_dir, config, days_to_keep=None, pattern='log*.log*'):
     """ Deletes old observation directories to free up space for new ones.
 
     Arguments:
         data_dir: [str] Path to the RMS data directory which contains the Captured and Archived directories
         config: [Configuration object]
         days_to_keep: [int] number of days to retain, default None means read from config file
+        pattern: [str] glob pattern of the log file names, 'log*.log*' (the RMS log files) by default
     """
     log_dir = os.path.join(data_dir, config.log_dir)
     
@@ -1156,7 +1234,7 @@ def deleteOldLogfiles(data_dir, config, days_to_keep=None):
     date_to_purge_to = timestamp(date_to_purge_to)
 
     # Only going to purge RMS log files
-    flist = glob.glob1(log_dir, 'log*.log*')
+    flist = glob.glob1(log_dir, pattern)
 
     for fl in flist:
 
